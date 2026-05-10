@@ -41,6 +41,25 @@ docker run -d \
   ghcr.io/quorinex/kiro-go:latest
 ```
 
+### Railway 部署
+
+这个项目已经自带 `Dockerfile`，可以直接通过 Railway 连接 GitHub 仓库部署。
+
+1. 在 Railway 里从你 fork 的 `Kiro-Go` 仓库新建一个 service
+2. 添加持久化卷，并挂载到 `/app/data`
+3. 设置环境变量 `CONFIG_PATH=/app/data/config.json`
+4. 设置一个强密码 `ADMIN_PASSWORD`
+5. 直接部署。Railway 会自动注入 `PORT`，程序会监听该端口
+
+首次部署完成后：
+
+- 打开 `/admin`
+- 用 `ADMIN_PASSWORD` 登录
+- 在管理面板里导入或添加 Kiro 账号
+- 如果要对外公开 API，建议先在设置页启用并配置 API Key
+
+如果没有挂载持久化卷，重启或重新部署后账号和设置都会丢失。
+
 ### 源码编译
 
 ```bash
@@ -80,6 +99,8 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
+| `PORT` | Railway / 容器监听端口覆盖 | 配置文件 / `8080` |
+| `HOST` | 监听地址覆盖 | 配置文件 |
 
 ## 参与贡献
 

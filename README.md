@@ -41,6 +41,25 @@ docker run -d \
   ghcr.io/quorinex/kiro-go:latest
 ```
 
+### Railway
+
+This project can be deployed directly from GitHub on Railway with the included `Dockerfile`.
+
+1. Create a new Railway service from your forked `Kiro-Go` repository.
+2. Add a persistent volume and mount it to `/app/data`.
+3. Set the environment variable `CONFIG_PATH=/app/data/config.json`.
+4. Set a strong `ADMIN_PASSWORD`.
+5. Deploy. Railway injects `PORT` automatically, and the app now listens on that port.
+
+After the first deploy:
+
+- Open `/admin`
+- Log in with the password from `ADMIN_PASSWORD`
+- Add your Kiro accounts in the admin panel
+- Optionally enable and set an API key in Settings before exposing the endpoint publicly
+
+Without a persistent volume, accounts and settings will be lost after a redeploy or restart.
+
 ### Build from Source
 
 ```bash
@@ -80,6 +99,8 @@ Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `PORT` | Listening port override for Railway / containers | config file / `8080` |
+| `HOST` | Listening host override | config file |
 
 ## Contributing
 

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 func main() {
@@ -46,6 +47,23 @@ func main() {
 		config.SetPassword(envPassword)
 	}
 
+	host := config.GetHost()
+	if envHost := os.Getenv("HOST"); envHost != "" {
+		host = envHost
+	}
+
+	port := config.GetPort()
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		parsedPort, err := strconv.Atoi(envPort)
+		if err != nil {
+			log.Fatalf("Invalid PORT value %q: %v", envPort, err)
+		}
+		port = parsedPort
+		if os.Getenv("HOST") == "" {
+			host = "0.0.0.0"
+		}
+	}
+
 	// 初始化账号池
 	pool.GetPool()
 
@@ -53,7 +71,7 @@ func main() {
 	handler := proxy.NewHandler()
 
 	// 启动服务器
-	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
+	addr := fmt.Sprintf("%s:%d", host, port)
 	log.Printf("Kiro-Go starting on http://%s", addr)
 	log.Printf("Admin panel: http://%s/admin", addr)
 	log.Printf("Claude API: http://%s/v1/messages", addr)
