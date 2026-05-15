@@ -85,11 +85,11 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 		}
 	}
 
-	if lastRole == "assistant" {
-		return "assistant-prefill final message is not supported; last message must be user"
-	}
 	if !hasUserContext {
 		return "at least one non-empty user message is required"
+	}
+	if lastRole == "assistant" {
+		return ""
 	}
 	return ""
 }
@@ -460,15 +460,18 @@ func (h *Handler) refreshModelsCache() {
 	for i := range accounts {
 		account := &accounts[i]
 		if err := h.ensureValidToken(account); err != nil {
+			h.pool.SetAccountModels(account.ID, nil)
 			fmt.Printf("[ModelsCache] Skip %s token refresh failed: %v\n", account.Email, err)
 			continue
 		}
 
 		models, err := ListAvailableModels(account)
 		if err != nil {
+			h.pool.SetAccountModels(account.ID, nil)
 			fmt.Printf("[ModelsCache] Failed to refresh for %s: %v\n", account.Email, err)
 			continue
 		}
+		h.pool.SetAccountModels(account.ID, modelIDs(models))
 		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
@@ -479,6 +482,20 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheMu.Unlock()
 		fmt.Printf("[ModelsCache] Cached %d models\n", len(aggregated))
 	}
+}
+
+func modelIDs(models []ModelInfo) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if strings.TrimSpace(model.ModelId) == "" {
+			continue
+		}
+		ids = append(ids, model.ModelId)
+	}
+	return ids
 }
 
 func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
@@ -608,9 +625,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 
 	// 获取账号
-	account := h.pool.GetNext()
+	account := h.pool.GetNextForModel(req.Model)
 	if account == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		h.refreshModelsCache()
+		account = h.pool.GetNextForModel(req.Model)
+	}
+	if account == nil {
+		h.sendClaudeError(w, 503, "api_error", "No available accounts for model: "+req.Model)
 		return
 	}
 
@@ -980,10 +1001,26 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		},
 	}
 
-	err := CallKiroAPI(account, payload, callback)
+	err := callKiroAPI(account, payload, callback)
 	if err != nil {
+		processClaudeText("", false, true)
+		if eventThinkingOpen {
+			sendText("", 3)
+			eventThinkingOpen = false
+		}
+		closeActiveBlock()
 		h.recordFailure()
 		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
+		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason": "error",
+			},
+			"usage": buildClaudeUsageMap(startInputTokens, 0, cacheUsage, cacheProfile != nil),
+		})
+		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+			"type": "message_stop",
+		})
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1216,9 +1253,13 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := h.pool.GetNext()
+	account := h.pool.GetNextForModel(req.Model)
 	if account == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+		h.refreshModelsCache()
+		account = h.pool.GetNextForModel(req.Model)
+	}
+	if account == nil {
+		h.sendOpenAIError(w, 503, "server_error", "No available accounts for model: "+req.Model)
 		return
 	}
 

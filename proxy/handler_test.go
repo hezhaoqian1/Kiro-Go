@@ -1,7 +1,14 @@
 package proxy
 
 import (
+	"errors"
+	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
+
+	"kiro-go/config"
+	"kiro-go/pool"
 )
 
 func TestThinkingSourceReasoningFirst(t *testing.T) {
@@ -88,7 +95,7 @@ func TestValidateOpenAIRequestShapeAllowsToolResultFinalTurn(t *testing.T) {
 	}
 }
 
-func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
+func TestValidateClaudeRequestShapeAllowsAssistantPrefill(t *testing.T) {
 	req := &ClaudeRequest{
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "hello"},
@@ -96,8 +103,8 @@ func TestValidateClaudeRequestShapeRejectsAssistantPrefill(t *testing.T) {
 		},
 	}
 
-	if msg := validateClaudeRequestShape(req); msg == "" {
-		t.Fatalf("expected assistant-prefill final message to be rejected")
+	if msg := validateClaudeRequestShape(req); msg != "" {
+		t.Fatalf("expected assistant-prefill final message to be allowed, got %q", msg)
 	}
 }
 
@@ -139,5 +146,75 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+func TestModelIDsPreservesNonEmptyEntries(t *testing.T) {
+	ids := modelIDs([]ModelInfo{
+		{ModelId: "claude-opus-4.7"},
+		{ModelId: ""},
+		{ModelId: "claude-sonnet-4.5"},
+	})
+
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 model ids, got %d", len(ids))
+	}
+	if ids[0] != "claude-opus-4.7" || ids[1] != "claude-sonnet-4.5" {
+		t.Fatalf("unexpected model ids: %#v", ids)
+	}
+}
+
+func TestHandleClaudeStreamClosesMessageBeforeError(t *testing.T) {
+	originalCall := callKiroAPI
+	callKiroAPI = func(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+		return errors.New("boom")
+	}
+	defer func() { callKiroAPI = originalCall }()
+
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	h := &Handler{
+		pool:        pool.GetPool(),
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeStream(
+		rec,
+		&config.Account{ID: "acct-1"},
+		&KiroPayload{},
+		"claude-opus-4-7",
+		false,
+		12,
+		promptCacheUsage{},
+		nil,
+	)
+
+	body := rec.Body.String()
+	for _, needle := range []string{
+		"event: message_start",
+		"event: message_delta",
+		"\"stop_reason\":\"error\"",
+		"event: message_stop",
+		"event: error",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("expected %q in stream body, got %q", needle, body)
+		}
+	}
+
+	if strings.Index(body, "event: message_stop") > strings.Index(body, "event: error") {
+		t.Fatalf("expected message_stop before error, got %q", body)
 	}
 }

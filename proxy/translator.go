@@ -164,14 +164,27 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
 	}
 
+	messages := req.Messages
+	var assistantPrefill string
+	if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
+		prefillText, toolUses := extractClaudeAssistantContent(messages[len(messages)-1].Content)
+		if len(toolUses) == 0 && strings.TrimSpace(prefillText) != "" {
+			assistantPrefill = prefillText
+			messages = messages[:len(messages)-1]
+		}
+	}
+
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
 	var currentContent string
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
 
-	for i, msg := range req.Messages {
+	for i, msg := range messages {
 		isLast := i == len(req.Messages)-1
+		if len(messages) > 0 {
+			isLast = i == len(messages)-1
+		}
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
@@ -226,6 +239,9 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	} else {
 		finalContent += minimalFallbackUserContent
 	}
+	if strings.TrimSpace(assistantPrefill) != "" {
+		finalContent += "\n\nContinue the assistant response from this exact prefix without repeating earlier content:\n" + assistantPrefill
+	}
 
 	// 转换工具
 	kiroTools := convertClaudeTools(req.Tools)
@@ -233,7 +249,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,

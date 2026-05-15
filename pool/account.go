@@ -3,7 +3,10 @@
 package pool
 
 import (
+	"fmt"
 	"kiro-go/config"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,24 +14,27 @@ import (
 
 // AccountPool 账号池
 type AccountPool struct {
-	mu           sync.RWMutex
-	accounts     []config.Account
-	currentIndex uint64
-	cooldowns    map[string]time.Time // 账号冷却时间
-	errorCounts  map[string]int       // 连续错误计数
+	mu            sync.RWMutex
+	accounts      []config.Account
+	currentIndex  uint64
+	cooldowns     map[string]time.Time // 账号冷却时间
+	errorCounts   map[string]int       // 连续错误计数
+	accountModels map[string]map[string]struct{}
 }
 
 var (
-	pool     *AccountPool
-	poolOnce sync.Once
+	pool               *AccountPool
+	poolOnce           sync.Once
+	claudeVersionRegex = regexp.MustCompile(`^(claude-(?:opus|sonnet|haiku))-(\d+)[.-](\d+)$`)
 )
 
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
+			cooldowns:     make(map[string]time.Time),
+			errorCounts:   make(map[string]int),
+			accountModels: make(map[string]map[string]struct{}),
 		}
 		pool.Reload()
 	})
@@ -42,7 +48,9 @@ func (p *AccountPool) Reload() {
 	defer p.mu.Unlock()
 	enabled := config.GetEnabledAccounts()
 	var weighted []config.Account
+	enabledIDs := make(map[string]struct{}, len(enabled))
 	for _, a := range enabled {
+		enabledIDs[a.ID] = struct{}{}
 		w := a.Weight
 		if w < 1 {
 			w = 1
@@ -52,10 +60,30 @@ func (p *AccountPool) Reload() {
 		}
 	}
 	p.accounts = weighted
+	for id := range p.accountModels {
+		if _, ok := enabledIDs[id]; !ok {
+			delete(p.accountModels, id)
+		}
+	}
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
 func (p *AccountPool) GetNext() *config.Account {
+	return p.getNextLocked(nil)
+}
+
+// GetNextForModel 获取支持指定模型的下一个可用账号。
+func (p *AccountPool) GetNextForModel(model string) *config.Account {
+	keys := modelLookupKeys(model)
+	if len(keys) == 0 {
+		return p.GetNext()
+	}
+	return p.getNextLocked(func(acc *config.Account) bool {
+		return p.supportsModelLocked(acc.ID, keys)
+	})
+}
+
+func (p *AccountPool) getNextLocked(filter func(*config.Account) bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -73,6 +101,10 @@ func (p *AccountPool) GetNext() *config.Account {
 		acc := &p.accounts[idx]
 
 		if seen[acc.ID] {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			seen[acc.ID] = true
 			continue
 		}
 
@@ -102,6 +134,9 @@ func (p *AccountPool) GetNext() *config.Account {
 	var earliest time.Time
 	for i := range p.accounts {
 		acc := &p.accounts[i]
+		if filter != nil && !filter(acc) {
+			continue
+		}
 		// 额度用尽的账号不作为 fallback
 		if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
 			continue
@@ -116,6 +151,70 @@ func (p *AccountPool) GetNext() *config.Account {
 		}
 	}
 	return best
+}
+
+func modelLookupKeys(model string) []string {
+	raw := strings.ToLower(strings.TrimSpace(model))
+	if raw == "" {
+		return nil
+	}
+
+	seen := map[string]struct{}{raw: {}}
+	keys := []string{raw}
+	add := func(candidate string) {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" {
+			return
+		}
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		keys = append(keys, candidate)
+	}
+
+	if matches := claudeVersionRegex.FindStringSubmatch(raw); len(matches) == 4 {
+		add(fmt.Sprintf("%s-%s.%s", matches[1], matches[2], matches[3]))
+		add(fmt.Sprintf("%s-%s-%s", matches[1], matches[2], matches[3]))
+	}
+
+	return keys
+}
+
+func (p *AccountPool) supportsModelLocked(accountID string, modelKeys []string) bool {
+	supported, ok := p.accountModels[accountID]
+	if !ok || len(supported) == 0 {
+		return false
+	}
+	for _, key := range modelKeys {
+		if _, exists := supported[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// SetAccountModels 更新单个账号的模型支持集合。
+func (p *AccountPool) SetAccountModels(id string, models []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(models) == 0 {
+		delete(p.accountModels, id)
+		return
+	}
+
+	supported := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		for _, key := range modelLookupKeys(model) {
+			supported[key] = struct{}{}
+		}
+	}
+	if len(supported) == 0 {
+		delete(p.accountModels, id)
+		return
+	}
+	p.accountModels[id] = supported
 }
 
 // GetByID 根据 ID 获取账号

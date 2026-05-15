@@ -35,3 +35,42 @@ func TestNormalizeChunkOverlapDelta(t *testing.T) {
 		t.Fatalf("expected overlap suffix delta, got %q", got)
 	}
 }
+
+func TestSupportsAmazonQModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"claude-sonnet-4.6", true},
+		{"claude-haiku-4.5", true},
+		{"claude-opus-4.7", false},
+		{"claude-opus-4-7", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		if got := supportsAmazonQModel(tc.model); got != tc.want {
+			t.Fatalf("supportsAmazonQModel(%q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestFilterEndpointsForModelSkipsAmazonQForUnsupportedModels(t *testing.T) {
+	endpoints := filterEndpointsForModel(kiroEndpoints, "claude-opus-4.7", "auto")
+	if len(endpoints) != 1 {
+		t.Fatalf("expected 1 endpoint, got %d", len(endpoints))
+	}
+	if endpoints[0].Name != "CodeWhisperer" {
+		t.Fatalf("expected CodeWhisperer only, got %s", endpoints[0].Name)
+	}
+}
+
+func TestFilterEndpointsForModelKeepsAmazonQWhenExplicitlyPreferred(t *testing.T) {
+	endpoints := filterEndpointsForModel(getSortedEndpoints("amazonq"), "claude-opus-4.7", "amazonq")
+	if len(endpoints) != 2 {
+		t.Fatalf("expected both endpoints to remain when amazonq is explicit, got %d", len(endpoints))
+	}
+	if endpoints[0].Name != "AmazonQ" {
+		t.Fatalf("expected AmazonQ to stay first, got %s", endpoints[0].Name)
+	}
+}

@@ -233,6 +233,33 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 	}
 }
 
+func TestClaudeToKiroTreatsFinalAssistantAsPrefill(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-opus-4-7",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Write a commit message."},
+			{Role: "assistant", Content: "fix:"},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	if len(payload.ConversationState.History) != 0 {
+		t.Fatalf("expected no assistant history for final prefill, got %d entries", len(payload.ConversationState.History))
+	}
+
+	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(content, "Write a commit message.") {
+		t.Fatalf("expected current content to preserve user request, got %q", content)
+	}
+	if !strings.Contains(content, "Continue the assistant response from this exact prefix") {
+		t.Fatalf("expected continuation instruction in current content, got %q", content)
+	}
+	if !strings.Contains(content, "fix:") {
+		t.Fatalf("expected assistant prefill prefix in current content, got %q", content)
+	}
+}
+
 func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	req := &OpenAIRequest{
 		Model: "claude-sonnet-4.5",

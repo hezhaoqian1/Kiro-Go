@@ -40,6 +40,11 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
+var amazonQModelAllowPrefixes = []string{
+	"claude-sonnet-4",
+	"claude-haiku-4",
+}
+
 // 全局 HTTP 客户端，复用连接池
 var kiroHttpClient = &http.Client{
 	Timeout: 5 * time.Minute,
@@ -51,6 +56,8 @@ var kiroHttpClient = &http.Client{
 		ForceAttemptHTTP2:   true,             // 尝试使用 HTTP/2
 	},
 }
+
+var callKiroAPI = CallKiroAPI
 
 // ==================== 请求结构 ====================
 
@@ -157,6 +164,39 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1]}
 }
 
+func supportsAmazonQModel(modelID string) bool {
+	model := strings.ToLower(strings.TrimSpace(modelID))
+	if model == "" {
+		return false
+	}
+	for _, prefix := range amazonQModelAllowPrefixes {
+		if strings.HasPrefix(model, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterEndpointsForModel(endpoints []kiroEndpoint, modelID string, preferred string) []kiroEndpoint {
+	if strings.EqualFold(strings.TrimSpace(preferred), "amazonq") {
+		return endpoints
+	}
+	if supportsAmazonQModel(modelID) {
+		return endpoints
+	}
+	filtered := make([]kiroEndpoint, 0, len(endpoints))
+	for _, ep := range endpoints {
+		if ep.Name == "AmazonQ" {
+			continue
+		}
+		filtered = append(filtered, ep)
+	}
+	if len(filtered) == 0 {
+		return endpoints
+	}
+	return filtered
+}
+
 // CallKiroAPI 调用 Kiro API（流式），双端点自动 fallback
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	if _, err := json.Marshal(payload); err != nil {
@@ -164,7 +204,12 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	// 根据配置排序端点
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	preferred := config.GetPreferredEndpoint()
+	endpoints := filterEndpointsForModel(
+		getSortedEndpoints(preferred),
+		payload.ConversationState.CurrentMessage.UserInputMessage.ModelID,
+		preferred,
+	)
 
 	var lastErr error
 	for _, ep := range endpoints {
