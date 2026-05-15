@@ -74,11 +74,19 @@ func (p *AccountPool) GetNext() *config.Account {
 
 // GetNextForModel 获取支持指定模型的下一个可用账号。
 func (p *AccountPool) GetNextForModel(model string) *config.Account {
+	return p.GetNextForModelExcluding(model, nil)
+}
+
+// GetNextForModelExcluding 获取支持指定模型、且不在排除列表中的下一个可用账号。
+func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]struct{}) *config.Account {
 	keys := modelLookupKeys(model)
-	if len(keys) == 0 {
-		return p.GetNext()
-	}
 	return p.getNextLocked(func(acc *config.Account) bool {
+		if _, skip := excluded[acc.ID]; skip {
+			return false
+		}
+		if len(keys) == 0 {
+			return true
+		}
 		return p.supportsModelLocked(acc.ID, keys)
 	})
 }
@@ -251,6 +259,27 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+// ExtendCooldown 延长账号冷却时间；如果已有更长冷却，则保留更长值。
+func (p *AccountPool) ExtendCooldown(id string, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	until := time.Now().Add(duration)
+	if current, ok := p.cooldowns[id]; ok && current.After(until) {
+		return
+	}
+	p.cooldowns[id] = until
+}
+
+// SetCurrentIndexForTest overrides the round-robin cursor for deterministic tests.
+func (p *AccountPool) SetCurrentIndexForTest(v uint64) {
+	atomic.StoreUint64(&p.currentIndex, v)
 }
 
 // UpdateToken 更新账号 Token

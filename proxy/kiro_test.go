@@ -1,6 +1,15 @@
 package proxy
 
-import "testing"
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"kiro-go/config"
+)
 
 func TestNormalizeChunkBasicProgression(t *testing.T) {
 	prev := ""
@@ -72,5 +81,50 @@ func TestFilterEndpointsForModelKeepsAmazonQWhenExplicitlyPreferred(t *testing.T
 	}
 	if endpoints[0].Name != "AmazonQ" {
 		t.Fatalf("expected AmazonQ to stay first, got %s", endpoints[0].Name)
+	}
+}
+
+func TestCallKiroAPITimesOutWithoutFirstEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	originalEndpoints := kiroEndpoints
+	originalTimeout := kiroFirstEventTimeout
+	kiroEndpoints = []kiroEndpoint{{
+		URL:       server.URL,
+		Origin:    "AI_EDITOR",
+		AmzTarget: "Test.GenerateAssistantResponse",
+		Name:      "TestEndpoint",
+	}, {
+		URL:       server.URL,
+		Origin:    "CLI",
+		AmzTarget: "Test.SendMessage",
+		Name:      "TestEndpoint2",
+	}}
+	kiroFirstEventTimeout = 50 * time.Millisecond
+	defer func() {
+		kiroEndpoints = originalEndpoints
+		kiroFirstEventTimeout = originalTimeout
+	}()
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage.ModelID = "claude-opus-4.7"
+
+	err := CallKiroAPI(&config.Account{
+		ID:          "acct-1",
+		AccessToken: "token",
+		MachineId:   "machine",
+	}, payload, &KiroStreamCallback{})
+	if !errors.Is(err, ErrKiroBootstrapTimeout) {
+		t.Fatalf("expected bootstrap timeout, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "bootstrap timeout") {
+		t.Fatalf("expected timeout error message, got %v", err)
 	}
 }

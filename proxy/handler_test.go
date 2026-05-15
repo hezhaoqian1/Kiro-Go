@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -192,12 +193,10 @@ func TestHandleClaudeStreamClosesMessageBeforeError(t *testing.T) {
 
 	h.handleClaudeStream(
 		rec,
-		&config.Account{ID: "acct-1"},
 		&KiroPayload{},
 		"claude-opus-4-7",
 		false,
 		12,
-		promptCacheUsage{},
 		nil,
 	)
 
@@ -216,5 +215,100 @@ func TestHandleClaudeStreamClosesMessageBeforeError(t *testing.T) {
 
 	if strings.Index(body, "event: message_stop") > strings.Index(body, "event: error") {
 		t.Fatalf("expected message_stop before error, got %q", body)
+	}
+}
+
+func TestHandleClaudeNonStreamRetriesNextAccountAfterBootstrapTimeout(t *testing.T) {
+	originalCall := callKiroAPI
+	callKiroAPI = func(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+		if account.ID == "acct-a" {
+			return ErrKiroBootstrapTimeout
+		}
+		callback.OnText("ok", false)
+		callback.OnComplete(5, 1)
+		return nil
+	}
+	defer func() { callKiroAPI = originalCall }()
+
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[{"id":"acct-a","email":"a@example.com","accessToken":"token-a","enabled":true,"expiresAt":4102444800},{"id":"acct-b","email":"b@example.com","accessToken":"token-b","enabled":true,"expiresAt":4102444800}]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	p := pool.GetPool()
+	p.Reload()
+	p.RecordSuccess("acct-a")
+	p.RecordSuccess("acct-b")
+	p.SetAccountModels("acct-a", []string{"claude-opus-4.7"})
+	p.SetAccountModels("acct-b", []string{"claude-opus-4.7"})
+	p.SetCurrentIndexForTest(^uint64(0))
+
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeNonStream(
+		rec,
+		&KiroPayload{},
+		"claude-opus-4.7",
+		false,
+		8,
+		nil,
+	)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"text":"ok"`) {
+		t.Fatalf("expected successful retry response, got %s", rec.Body.String())
+	}
+	if got := p.AvailableCount(); got != 1 {
+		t.Fatalf("expected one available account after cooling failed account, got %d", got)
+	}
+}
+
+func TestExecuteWithAccountRetryReturnsLastBootstrapErrorWhenNoBackup(t *testing.T) {
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[{"id":"acct-a","email":"a@example.com","accessToken":"token-a","enabled":true,"expiresAt":4102444800}]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	p := pool.GetPool()
+	p.Reload()
+	p.SetAccountModels("acct-a", []string{"claude-opus-4.7"})
+	p.RecordSuccess("acct-a")
+	p.SetCurrentIndexForTest(^uint64(0))
+
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	_, err = h.executeWithAccountRetry("claude-opus-4.7", func(account *config.Account) (bool, error) {
+		return false, fmt.Errorf("%w: test", ErrKiroBootstrapTimeout)
+	})
+	if !errors.Is(err, ErrKiroBootstrapTimeout) {
+		t.Fatalf("expected bootstrap timeout, got %v", err)
+	}
+	if got := p.AvailableCount(); got != 0 {
+		t.Fatalf("expected failed account to be cooled down immediately, got available=%d", got)
 	}
 }

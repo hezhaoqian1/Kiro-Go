@@ -137,7 +137,7 @@ type AccountInfo struct {
 }
 
 // Version 当前版本号
-const Version = "1.0.4"
+const Version = "1.0.5"
 
 var (
 	cfg     *Config

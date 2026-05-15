@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/config"
@@ -45,15 +46,20 @@ var amazonQModelAllowPrefixes = []string{
 	"claude-haiku-4",
 }
 
+var ErrKiroBootstrapTimeout = errors.New("kiro bootstrap timeout before first event")
+
+var kiroFirstEventTimeout = 12 * time.Second
+
 // 全局 HTTP 客户端，复用连接池
 var kiroHttpClient = &http.Client{
 	Timeout: 5 * time.Minute,
 	Transport: &http.Transport{
-		MaxIdleConns:        100,              // 最大空闲连接数
-		MaxIdleConnsPerHost: 20,               // 每个 Host 最大空闲连接数
-		IdleConnTimeout:     90 * time.Second, // 空闲连接超时
-		DisableCompression:  false,            // 启用压缩
-		ForceAttemptHTTP2:   true,             // 尝试使用 HTTP/2
+		MaxIdleConns:          100,              // 最大空闲连接数
+		MaxIdleConnsPerHost:   20,               // 每个 Host 最大空闲连接数
+		IdleConnTimeout:       90 * time.Second, // 空闲连接超时
+		ResponseHeaderTimeout: 20 * time.Second, // 首响应头超时
+		DisableCompression:    false,            // 启用压缩
+		ForceAttemptHTTP2:     true,             // 尝试使用 HTTP/2
 	},
 }
 
@@ -264,7 +270,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		err = parseEventStreamWithBootstrapTimeout(resp.Body, callback, kiroFirstEventTimeout)
 		resp.Body.Close()
 		return err
 	}
@@ -275,16 +281,56 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	return fmt.Errorf("all endpoints failed")
 }
 
+func parseEventStreamWithBootstrapTimeout(body io.ReadCloser, callback *KiroStreamCallback, timeout time.Duration) error {
+	if timeout <= 0 {
+		return parseEventStream(body, callback, nil)
+	}
+
+	firstEventCh := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- parseEventStream(body, callback, func() {
+			select {
+			case firstEventCh <- struct{}{}:
+			default:
+			}
+		})
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	firstEventSeen := false
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case <-firstEventCh:
+			firstEventSeen = true
+		case <-timer.C:
+			if firstEventSeen {
+				continue
+			}
+			_ = body.Close()
+			if err := <-errCh; err != nil && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("%w: %v", ErrKiroBootstrapTimeout, err)
+			}
+			return ErrKiroBootstrapTimeout
+		}
+	}
+}
+
 // ==================== Event Stream 解析 ====================
 
 // parseEventStream 解析 AWS Event Stream 二进制格式
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+func parseEventStream(body io.Reader, callback *KiroStreamCallback, onFirstEvent func()) error {
 	// 不使用 bufio，直接读取避免缓冲延迟
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	firstEventSeen := false
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -325,6 +371,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		var event map[string]interface{}
 		if err := json.Unmarshal(payloadBytes, &event); err != nil {
 			continue
+		}
+		if !firstEventSeen {
+			firstEventSeen = true
+			if onFirstEvent != nil {
+				onFirstEvent()
+			}
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)

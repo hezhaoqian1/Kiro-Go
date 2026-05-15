@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/pool"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -131,6 +134,86 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 		return "at least one non-empty user message is required"
 	}
 	return ""
+}
+
+const transientAccountCooldown = 2 * time.Minute
+
+func isQuotaLikeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "quota exhausted") ||
+		strings.Contains(msg, "http 429") ||
+		strings.Contains(msg, " 429")
+}
+
+func isRetryableBootstrapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrKiroBootstrapTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "all endpoints failed") ||
+		strings.Contains(msg, "quota exhausted")
+}
+
+func (h *Handler) executeWithAccountRetry(model string, invoke func(account *config.Account) (bool, error)) (*config.Account, error) {
+	tried := make(map[string]struct{})
+	refreshedModels := false
+	var lastErr error
+
+	for {
+		account := h.pool.GetNextForModelExcluding(model, tried)
+		if account == nil && !refreshedModels {
+			h.refreshModelsCache()
+			refreshedModels = true
+			account = h.pool.GetNextForModelExcluding(model, tried)
+		}
+		if account == nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, fmt.Errorf("No available accounts for model: %s", model)
+		}
+
+		if err := h.ensureValidToken(account); err != nil {
+			lastErr = fmt.Errorf("Token refresh failed: %w", err)
+			h.pool.RecordError(account.ID, false)
+			h.pool.ExtendCooldown(account.ID, transientAccountCooldown)
+			tried[account.ID] = struct{}{}
+			continue
+		}
+
+		started, err := invoke(account)
+		if err == nil {
+			return account, nil
+		}
+
+		lastErr = err
+		isQuota := isQuotaLikeError(err)
+		h.pool.RecordError(account.ID, isQuota)
+		if !isQuota && isRetryableBootstrapError(err) {
+			h.pool.ExtendCooldown(account.ID, transientAccountCooldown)
+		}
+		if started || !isRetryableBootstrapError(err) {
+			return nil, err
+		}
+
+		tried[account.ID] = struct{}{}
+	}
 }
 
 func NewHandler() *Handler {
@@ -624,44 +707,26 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 获取账号
-	account := h.pool.GetNextForModel(req.Model)
-	if account == nil {
-		h.refreshModelsCache()
-		account = h.pool.GetNextForModel(req.Model)
-	}
-	if account == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts for model: "+req.Model)
-		return
-	}
-
-	// 检查并刷新 token
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
-		return
-	}
-
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateClaudeRequestInputTokens(&req)
 	cacheProfile := h.promptCache.BuildClaudeProfile(&req, estimatedInputTokens)
-	cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// 流式或非流式
 	if req.Stream {
-		h.handleClaudeStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile)
 	} else {
-		h.handleClaudeNonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheUsage, cacheProfile)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -685,6 +750,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	activeBlockIndex := -1
 	activeBlockType := ""
 	startInputTokens := estimatedInputTokens
+	cacheUsage := promptCacheUsage{}
 
 	closeActiveBlock := func() {
 		if activeBlockIndex < 0 {
@@ -937,71 +1003,73 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		},
 	})
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if text == "" {
-				return
-			}
-			if isThinking {
-				rawThinkingBuilder.WriteString(text)
-			} else {
-				rawContentBuilder.WriteString(text)
-			}
-			processClaudeText(text, isThinking, false)
-		},
-		OnToolUse: func(tu KiroToolUse) {
-			// 先刷新缓冲区
-			processClaudeText("", false, true)
-			rawContentBuilder.WriteString(tu.Name)
-			if b, err := json.Marshal(tu.Input); err == nil {
-				rawContentBuilder.Write(b)
-			}
+	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+		attemptStarted := false
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if text == "" {
+					return
+				}
+				attemptStarted = true
+				if isThinking {
+					rawThinkingBuilder.WriteString(text)
+				} else {
+					rawContentBuilder.WriteString(text)
+				}
+				processClaudeText(text, isThinking, false)
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				attemptStarted = true
+				// 先刷新缓冲区
+				processClaudeText("", false, true)
+				rawContentBuilder.WriteString(tu.Name)
+				if b, err := json.Marshal(tu.Input); err == nil {
+					rawContentBuilder.Write(b)
+				}
 
-			toolUses = append(toolUses, tu)
-			closeActiveBlock()
+				toolUses = append(toolUses, tu)
+				closeActiveBlock()
 
-			idx := nextContentIndex
-			nextContentIndex++
+				idx := nextContentIndex
+				nextContentIndex++
 
-			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-				"type":  "content_block_start",
-				"index": idx,
-				"content_block": map[string]interface{}{
-					"type":  "tool_use",
-					"id":    tu.ToolUseID,
-					"name":  tu.Name,
-					"input": map[string]interface{}{},
-				},
-			})
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": idx,
+					"content_block": map[string]interface{}{
+						"type":  "tool_use",
+						"id":    tu.ToolUseID,
+						"name":  tu.Name,
+						"input": map[string]interface{}{},
+					},
+				})
 
-			inputJSON, _ := json.Marshal(tu.Input)
-			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": idx,
-				"delta": map[string]interface{}{
-					"type":         "input_json_delta",
-					"partial_json": string(inputJSON),
-				},
-			})
+				inputJSON, _ := json.Marshal(tu.Input)
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": string(inputJSON),
+					},
+				})
 
-			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-				"type":  "content_block_stop",
-				"index": idx,
-			})
-		},
-		OnComplete: func(inTok, outTok int) {
-			inputTokens = inTok
-			outputTokens = outTok
-		},
-		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
-		},
-		OnCredits: func(c float64) {
-			credits = c
-		},
-	}
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": idx,
+				})
+			},
+			OnComplete: func(inTok, outTok int) {
+				inputTokens = inTok
+				outputTokens = outTok
+			},
+			OnCredits: func(c float64) {
+				credits = c
+			},
+		}
 
-	err := callKiroAPI(account, payload, callback)
+		return attemptStarted, callKiroAPI(account, payload, callback)
+	})
 	if err != nil {
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
@@ -1010,7 +1078,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		}
 		closeActiveBlock()
 		h.recordFailure()
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
@@ -1027,6 +1094,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 		})
 		return
 	}
+	cacheUsage = h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 刷新剩余缓冲区
 	processClaudeText("", false, true)
@@ -1134,43 +1202,64 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheUsage promptCacheUsage, cacheProfile *promptCacheProfile) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile) {
 	var content string
 	var thinkingContent string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
 	var credits float64
+	cacheUsage := promptCacheUsage{}
+	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+		var attemptContent string
+		var attemptThinking string
+		var attemptToolUses []KiroToolUse
+		var attemptInputTokens, attemptOutputTokens int
+		var attemptCredits float64
+		attemptStarted := false
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if isThinking {
-				thinkingContent += text
-			} else {
-				content += text
-			}
-		},
-		OnToolUse: func(tu KiroToolUse) {
-			toolUses = append(toolUses, tu)
-		},
-		OnComplete: func(inTok, outTok int) {
-			inputTokens = inTok
-			outputTokens = outTok
-		},
-		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		},
-		OnCredits: func(c float64) {
-			credits = c
-		},
-	}
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if text == "" {
+					return
+				}
+				attemptStarted = true
+				if isThinking {
+					attemptThinking += text
+				} else {
+					attemptContent += text
+				}
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				attemptStarted = true
+				attemptToolUses = append(attemptToolUses, tu)
+			},
+			OnComplete: func(inTok, outTok int) {
+				attemptInputTokens = inTok
+				attemptOutputTokens = outTok
+			},
+			OnCredits: func(c float64) {
+				attemptCredits = c
+			},
+		}
 
-	err := CallKiroAPI(account, payload, callback)
+		if err := callKiroAPI(account, payload, callback); err != nil {
+			return attemptStarted, err
+		}
+
+		content = attemptContent
+		thinkingContent = attemptThinking
+		toolUses = attemptToolUses
+		inputTokens = attemptInputTokens
+		outputTokens = attemptOutputTokens
+		credits = attemptCredits
+		return attemptStarted, nil
+	})
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.sendClaudeError(w, 500, "api_error", err.Error())
 		return
 	}
+	cacheUsage = h.promptCache.Compute(account.ID, cacheProfile)
 
 	// 合并 thinking 内容（如果有 reasoningContentEvent 的内容）
 	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
@@ -1253,21 +1342,6 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := h.pool.GetNextForModel(req.Model)
-	if account == nil {
-		h.refreshModelsCache()
-		account = h.pool.GetNextForModel(req.Model)
-	}
-	if account == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts for model: "+req.Model)
-		return
-	}
-
-	if err := h.ensureValidToken(account); err != nil {
-		h.sendOpenAIError(w, 503, "server_error", "Token refresh failed")
-		return
-	}
-
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
@@ -1277,14 +1351,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	if req.Stream {
-		h.handleOpenAIStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	} else {
-		h.handleOpenAINonStream(w, account, kiroPayload, req.Model, thinking, estimatedInputTokens)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1535,72 +1609,73 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 		}
 	}
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if text == "" {
-				return
-			}
-			if isThinking {
-				rawReasoningBuilder.WriteString(text)
-			} else {
-				rawContentBuilder.WriteString(text)
-			}
-			processText(text, isThinking, false)
-		},
-		OnToolUse: func(tu KiroToolUse) {
-			// 先刷新缓冲区
-			processText("", false, true)
+	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+		attemptStarted := false
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if text == "" {
+					return
+				}
+				attemptStarted = true
+				if isThinking {
+					rawReasoningBuilder.WriteString(text)
+				} else {
+					rawContentBuilder.WriteString(text)
+				}
+				processText(text, isThinking, false)
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				attemptStarted = true
+				// 先刷新缓冲区
+				processText("", false, true)
 
-			args, _ := json.Marshal(tu.Input)
-			rawContentBuilder.WriteString(tu.Name)
-			rawContentBuilder.Write(args)
-			tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
-			tc.Function.Name = tu.Name
-			tc.Function.Arguments = string(args)
-			toolCalls = append(toolCalls, tc)
+				args, _ := json.Marshal(tu.Input)
+				rawContentBuilder.WriteString(tu.Name)
+				rawContentBuilder.Write(args)
+				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+				tc.Function.Name = tu.Name
+				tc.Function.Arguments = string(args)
+				toolCalls = append(toolCalls, tc)
 
-			chunk := map[string]interface{}{
-				"id":      chatID,
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   model,
-				"choices": []map[string]interface{}{{
-					"index": 0,
-					"delta": map[string]interface{}{
-						"tool_calls": []map[string]interface{}{{
-							"index": toolCallIndex,
-							"id":    tu.ToolUseID,
-							"type":  "function",
-							"function": map[string]string{
-								"name":      tu.Name,
-								"arguments": string(args),
-							},
-						}},
-					},
-					"finish_reason": nil,
-				}},
-			}
-			toolCallIndex++
-			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
-			flusher.Flush()
-		},
-		OnComplete: func(inTok, outTok int) {
-			inputTokens = inTok
-			outputTokens = outTok
-		},
-		OnError: func(err error) {
-			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
-		},
-		OnCredits: func(c float64) {
-			credits = c
-		},
-	}
+				chunk := map[string]interface{}{
+					"id":      chatID,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   model,
+					"choices": []map[string]interface{}{{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{{
+								"index": toolCallIndex,
+								"id":    tu.ToolUseID,
+								"type":  "function",
+								"function": map[string]string{
+									"name":      tu.Name,
+									"arguments": string(args),
+								},
+							}},
+						},
+						"finish_reason": nil,
+					}},
+				}
+				toolCallIndex++
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
+			},
+			OnComplete: func(inTok, outTok int) {
+				inputTokens = inTok
+				outputTokens = outTok
+			},
+			OnCredits: func(c float64) {
+				credits = c
+			},
+		}
 
-	err := CallKiroAPI(account, payload, callback)
+		return attemptStarted, callKiroAPI(account, payload, callback)
+	})
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		return
 	}
 
@@ -1661,31 +1736,59 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	var content string
 	var reasoningContent string
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
 	var credits float64
+	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+		var attemptContent string
+		var attemptReasoning string
+		var attemptToolUses []KiroToolUse
+		var attemptInputTokens, attemptOutputTokens int
+		var attemptCredits float64
+		attemptStarted := false
 
-	callback := &KiroStreamCallback{
-		OnText: func(text string, isThinking bool) {
-			if isThinking {
-				reasoningContent += text
-			} else {
-				content += text
-			}
-		},
-		OnToolUse:  func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
-		OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
-		OnError:    func(err error) { h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429")) },
-		OnCredits:  func(c float64) { credits = c },
-	}
+		callback := &KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				if text == "" {
+					return
+				}
+				attemptStarted = true
+				if isThinking {
+					attemptReasoning += text
+				} else {
+					attemptContent += text
+				}
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				attemptStarted = true
+				attemptToolUses = append(attemptToolUses, tu)
+			},
+			OnComplete: func(inTok, outTok int) {
+				attemptInputTokens = inTok
+				attemptOutputTokens = outTok
+			},
+			OnCredits: func(c float64) {
+				attemptCredits = c
+			},
+		}
 
-	err := CallKiroAPI(account, payload, callback)
+		if err := callKiroAPI(account, payload, callback); err != nil {
+			return attemptStarted, err
+		}
+
+		content = attemptContent
+		reasoningContent = attemptReasoning
+		toolUses = attemptToolUses
+		inputTokens = attemptInputTokens
+		outputTokens = attemptOutputTokens
+		credits = attemptCredits
+		return attemptStarted, nil
+	})
 	if err != nil {
 		h.recordFailure()
-		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429"))
 		h.sendOpenAIError(w, 500, "server_error", err.Error())
 		return
 	}
