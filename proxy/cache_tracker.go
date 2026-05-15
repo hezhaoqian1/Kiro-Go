@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +93,21 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 		Breakpoints:      breakpoints,
 		TotalInputTokens: totalInputTokens,
 	}
+}
+
+func (p *promptCacheProfile) StickyKey() string {
+	if p == nil || len(p.Breakpoints) == 0 {
+		return ""
+	}
+	last := p.Breakpoints[len(p.Breakpoints)-1]
+	return fmt.Sprintf("%x", last.Fingerprint[:])
+}
+
+func stickyKeyFromCacheProfile(profile *promptCacheProfile) string {
+	if profile == nil {
+		return ""
+	}
+	return profile.StickyKey()
 }
 
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {

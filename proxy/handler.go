@@ -37,6 +37,13 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
+	stickyMu        sync.Mutex
+	stickyAccounts  map[string]stickyAccountEntry
+}
+
+type stickyAccountEntry struct {
+	AccountID string
+	ExpiresAt time.Time
 }
 
 type thinkingStreamSource int
@@ -137,6 +144,7 @@ func validateOpenAIRequestShape(req *OpenAIRequest) string {
 }
 
 const transientAccountCooldown = 2 * time.Minute
+const stickyAccountTTL = 5 * time.Minute
 
 func isQuotaLikeError(err error) bool {
 	if err == nil {
@@ -170,17 +178,87 @@ func isRetryableBootstrapError(err error) bool {
 		strings.Contains(msg, "quota exhausted")
 }
 
-func (h *Handler) executeWithAccountRetry(model string, invoke func(account *config.Account) (bool, error)) (*config.Account, error) {
+func (h *Handler) preferredStickyAccount(stickyKey string) string {
+	if h == nil || strings.TrimSpace(stickyKey) == "" {
+		return ""
+	}
+	h.stickyMu.Lock()
+	defer h.stickyMu.Unlock()
+	if h.stickyAccounts == nil {
+		return ""
+	}
+	entry, ok := h.stickyAccounts[stickyKey]
+	if !ok {
+		return ""
+	}
+	if time.Now().After(entry.ExpiresAt) {
+		delete(h.stickyAccounts, stickyKey)
+		return ""
+	}
+	return entry.AccountID
+}
+
+func (h *Handler) rememberStickyAccount(stickyKey string, accountID string) {
+	if h == nil || strings.TrimSpace(stickyKey) == "" || strings.TrimSpace(accountID) == "" {
+		return
+	}
+	h.stickyMu.Lock()
+	defer h.stickyMu.Unlock()
+	if h.stickyAccounts == nil {
+		h.stickyAccounts = make(map[string]stickyAccountEntry)
+	}
+	h.stickyAccounts[stickyKey] = stickyAccountEntry{
+		AccountID: accountID,
+		ExpiresAt: time.Now().Add(stickyAccountTTL),
+	}
+}
+
+func (h *Handler) forgetStickyAccount(stickyKey string, accountID string) {
+	if h == nil || strings.TrimSpace(stickyKey) == "" {
+		return
+	}
+	h.stickyMu.Lock()
+	defer h.stickyMu.Unlock()
+	if h.stickyAccounts == nil {
+		return
+	}
+	entry, ok := h.stickyAccounts[stickyKey]
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(accountID) == "" || entry.AccountID == accountID {
+		delete(h.stickyAccounts, stickyKey)
+	}
+}
+
+func (h *Handler) executeWithAccountRetry(model string, stickyKey string, invoke func(account *config.Account) (bool, error)) (*config.Account, error) {
 	tried := make(map[string]struct{})
 	refreshedModels := false
 	var lastErr error
 
 	for {
-		account := h.pool.GetNextForModelExcluding(model, tried)
+		var account *config.Account
+		if preferred := h.preferredStickyAccount(stickyKey); preferred != "" {
+			account = h.pool.GetPreferredForModel(model, preferred, tried)
+			if account == nil {
+				h.forgetStickyAccount(stickyKey, preferred)
+			}
+		}
+		if account == nil {
+			account = h.pool.GetNextForModelExcluding(model, tried)
+		}
 		if account == nil && !refreshedModels {
 			h.refreshModelsCache()
 			refreshedModels = true
-			account = h.pool.GetNextForModelExcluding(model, tried)
+			if preferred := h.preferredStickyAccount(stickyKey); preferred != "" {
+				account = h.pool.GetPreferredForModel(model, preferred, tried)
+				if account == nil {
+					h.forgetStickyAccount(stickyKey, preferred)
+				}
+			}
+			if account == nil {
+				account = h.pool.GetNextForModelExcluding(model, tried)
+			}
 		}
 		if account == nil {
 			if lastErr != nil {
@@ -199,12 +277,14 @@ func (h *Handler) executeWithAccountRetry(model string, invoke func(account *con
 
 		started, err := invoke(account)
 		if err == nil {
+			h.rememberStickyAccount(stickyKey, account.ID)
 			return account, nil
 		}
 
 		lastErr = err
 		isQuota := isQuotaLikeError(err)
 		h.pool.RecordError(account.ID, isQuota)
+		h.forgetStickyAccount(stickyKey, account.ID)
 		if !isQuota && isRetryableBootstrapError(err) {
 			h.pool.ExtendCooldown(account.ID, transientAccountCooldown)
 		}
@@ -229,6 +309,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		stickyAccounts:  make(map[string]stickyAccountEntry),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -1014,7 +1095,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		},
 	})
 
-	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+	account, err := h.executeWithAccountRetry(model, stickyKeyFromCacheProfile(cacheProfile), func(account *config.Account) (bool, error) {
 		attemptStarted := false
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1220,7 +1301,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	var inputTokens, outputTokens int
 	var credits float64
 	cacheUsage := promptCacheUsage{}
-	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+	account, err := h.executeWithAccountRetry(model, stickyKeyFromCacheProfile(cacheProfile), func(account *config.Account) (bool, error) {
 		var attemptContent string
 		var attemptThinking string
 		var attemptToolUses []KiroToolUse
@@ -1620,7 +1701,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 	}
 
-	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+	account, err := h.executeWithAccountRetry(model, "", func(account *config.Account) (bool, error) {
 		attemptStarted := false
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1753,7 +1834,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	var toolUses []KiroToolUse
 	var inputTokens, outputTokens int
 	var credits float64
-	account, err := h.executeWithAccountRetry(model, func(account *config.Account) (bool, error) {
+	account, err := h.executeWithAccountRetry(model, "", func(account *config.Account) (bool, error) {
 		var attemptContent string
 		var attemptReasoning string
 		var attemptToolUses []KiroToolUse
@@ -2549,6 +2630,7 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
 		"uptime":          time.Now().Unix() - h.startTime,
+		"availability":    h.pool.AvailabilitySnapshot(),
 	})
 }
 

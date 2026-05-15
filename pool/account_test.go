@@ -110,3 +110,30 @@ func TestExtendCooldownKeepsLongerExistingWindow(t *testing.T) {
 		t.Fatalf("expected longer cooldown to remain, got %v want >= %v", got, longer)
 	}
 }
+
+func TestAvailabilitySnapshotIncludesCooldownReason(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "acct-a", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		},
+		cooldowns:     make(map[string]time.Time),
+		errorCounts:   make(map[string]int),
+		accountModels: make(map[string]map[string]struct{}),
+	}
+	p.SetAccountModels("acct-a", []string{"claude-opus-4.7"})
+	p.ExtendCooldown("acct-a", time.Minute)
+
+	items := p.AvailabilitySnapshot()
+	if len(items) != 1 {
+		t.Fatalf("expected one account, got %d", len(items))
+	}
+	if items[0].Available {
+		t.Fatalf("expected account unavailable")
+	}
+	if items[0].Reason != "cooldown" {
+		t.Fatalf("expected cooldown reason, got %q", items[0].Reason)
+	}
+	if items[0].CooldownUntil == 0 {
+		t.Fatalf("expected cooldown timestamp")
+	}
+}

@@ -392,7 +392,7 @@ func TestExecuteWithAccountRetryReturnsLastBootstrapErrorWhenNoBackup(t *testing
 		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
 	}
 
-	_, err = h.executeWithAccountRetry("claude-opus-4.7", func(account *config.Account) (bool, error) {
+	_, err = h.executeWithAccountRetry("claude-opus-4.7", "", func(account *config.Account) (bool, error) {
 		return false, fmt.Errorf("%w: test", ErrKiroBootstrapTimeout)
 	})
 	if !errors.Is(err, ErrKiroBootstrapTimeout) {
@@ -400,5 +400,45 @@ func TestExecuteWithAccountRetryReturnsLastBootstrapErrorWhenNoBackup(t *testing
 	}
 	if got := p.AvailableCount(); got != 0 {
 		t.Fatalf("expected failed account to be cooled down immediately, got available=%d", got)
+	}
+}
+
+func TestExecuteWithAccountRetryPrefersStickyAccount(t *testing.T) {
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[{"id":"acct-a","email":"a@example.com","accessToken":"token-a","enabled":true,"expiresAt":4102444800},{"id":"acct-b","email":"b@example.com","accessToken":"token-b","enabled":true,"expiresAt":4102444800}]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	p := pool.GetPool()
+	p.Reload()
+	p.SetAccountModels("acct-a", []string{"claude-opus-4.7"})
+	p.SetAccountModels("acct-b", []string{"claude-opus-4.7"})
+	p.RecordSuccess("acct-a")
+	p.RecordSuccess("acct-b")
+	p.SetCurrentIndexForTest(0)
+
+	h := &Handler{
+		pool:           p,
+		promptCache:    newPromptCacheTracker(defaultPromptCacheTTL),
+		stickyAccounts: make(map[string]stickyAccountEntry),
+	}
+	h.rememberStickyAccount("cache-key", "acct-a")
+
+	account, err := h.executeWithAccountRetry("claude-opus-4.7", "cache-key", func(account *config.Account) (bool, error) {
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if account.ID != "acct-a" {
+		t.Fatalf("expected sticky acct-a, got %s", account.ID)
 	}
 }

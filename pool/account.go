@@ -22,6 +22,17 @@ type AccountPool struct {
 	accountModels map[string]map[string]struct{}
 }
 
+type AccountAvailability struct {
+	ID             string   `json:"id"`
+	Available      bool     `json:"available"`
+	Reason         string   `json:"reason,omitempty"`
+	CooldownUntil  int64    `json:"cooldownUntil,omitempty"`
+	ExpiresAt      int64    `json:"expiresAt,omitempty"`
+	UsageCurrent   float64  `json:"usageCurrent,omitempty"`
+	UsageLimit     float64  `json:"usageLimit,omitempty"`
+	SupportedModel []string `json:"supportedModels,omitempty"`
+}
+
 var (
 	pool               *AccountPool
 	poolOnce           sync.Once
@@ -91,6 +102,45 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	})
 }
 
+func (p *AccountPool) GetPreferredForModel(model string, preferredID string, excluded map[string]struct{}) *config.Account {
+	preferredID = strings.TrimSpace(preferredID)
+	if preferredID == "" {
+		return nil
+	}
+
+	keys := modelLookupKeys(model)
+	return p.getByIDLocked(preferredID, func(acc *config.Account) bool {
+		if _, skip := excluded[acc.ID]; skip {
+			return false
+		}
+		if len(keys) == 0 {
+			return true
+		}
+		return p.supportsModelLocked(acc.ID, keys)
+	})
+}
+
+func (p *AccountPool) getByIDLocked(id string, filter func(*config.Account) bool) *config.Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if acc.ID != id {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			return nil
+		}
+		if !p.isRuntimeAvailableLocked(acc, now) {
+			return nil
+		}
+		return acc
+	}
+	return nil
+}
+
 func (p *AccountPool) getNextLocked(filter func(*config.Account) bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -116,20 +166,7 @@ func (p *AccountPool) getNextLocked(filter func(*config.Account) bool) *config.A
 			continue
 		}
 
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-300 {
-			seen[acc.ID] = true
-			continue
-		}
-
-		// 跳过额度已用尽的账号（适用于所有订阅类型）
-		if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
+		if !p.isRuntimeAvailableLocked(acc, now) {
 			seen[acc.ID] = true
 			continue
 		}
@@ -159,6 +196,19 @@ func (p *AccountPool) getNextLocked(filter func(*config.Account) bool) *config.A
 		}
 	}
 	return best
+}
+
+func (p *AccountPool) isRuntimeAvailableLocked(acc *config.Account, now time.Time) bool {
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-300 {
+		return false
+	}
+	if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
+		return false
+	}
+	return true
 }
 
 func modelLookupKeys(model string) []string {
@@ -318,6 +368,50 @@ func (p *AccountPool) AvailableCount() int {
 		count++
 	}
 	return count
+}
+
+func (p *AccountPool) AvailabilitySnapshot() []AccountAvailability {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := time.Now()
+	seen := make(map[string]struct{}, len(p.accounts))
+	result := make([]AccountAvailability, 0, len(p.accounts))
+	for _, acc := range p.accounts {
+		if _, ok := seen[acc.ID]; ok {
+			continue
+		}
+		seen[acc.ID] = struct{}{}
+
+		item := AccountAvailability{
+			ID:           acc.ID,
+			Available:    true,
+			ExpiresAt:    acc.ExpiresAt,
+			UsageCurrent: acc.UsageCurrent,
+			UsageLimit:   acc.UsageLimit,
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			item.Available = false
+			item.Reason = "cooldown"
+			item.CooldownUntil = cooldown.Unix()
+		} else if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-300 {
+			item.Available = false
+			item.Reason = "token_expiring"
+		} else if acc.UsageLimit > 0 && acc.UsageCurrent >= acc.UsageLimit {
+			item.Available = false
+			item.Reason = "usage_exhausted"
+		}
+
+		if models := p.accountModels[acc.ID]; len(models) > 0 {
+			item.SupportedModel = make([]string, 0, len(models))
+			for model := range models {
+				item.SupportedModel = append(item.SupportedModel, model)
+			}
+		}
+
+		result = append(result, item)
+	}
+	return result
 }
 
 // UpdateStats 更新账号统计
