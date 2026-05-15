@@ -729,7 +729,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	// Force a clean EOF after message_stop. Claude Code occasionally lingers
+	// after receiving the final assistant text but before producing the final
+	// result event when the proxy keeps the connection reusable.
+	w.Header().Set("Connection", "close")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -857,6 +860,14 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		default:
 			if thinkingState == 3 && text == "" {
 				if activeBlockType == "thinking" {
+					h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": activeBlockIndex,
+						"delta": map[string]string{
+							"type":      "signature_delta",
+							"signature": "",
+						},
+					})
 					closeActiveBlock()
 				}
 				return
@@ -1361,7 +1372,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Connection", "close")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

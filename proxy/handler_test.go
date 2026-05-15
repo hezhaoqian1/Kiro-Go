@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -274,6 +275,95 @@ func TestHandleClaudeNonStreamRetriesNextAccountAfterBootstrapTimeout(t *testing
 	}
 	if got := p.AvailableCount(); got != 1 {
 		t.Fatalf("expected one available account after cooling failed account, got %d", got)
+	}
+}
+
+func TestHandleClaudeStreamEmitsSignatureDeltaBeforeThinkingStop(t *testing.T) {
+	originalCall := callKiroAPI
+	callKiroAPI = func(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnText("reasoning", true)
+		callback.OnComplete(5, 1)
+		return nil
+	}
+	defer func() { callKiroAPI = originalCall }()
+
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	h := &Handler{
+		pool:        pool.GetPool(),
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeStream(
+		rec,
+		&KiroPayload{},
+		"claude-opus-4-7",
+		true,
+		12,
+		nil,
+	)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `"type":"signature_delta"`) {
+		t.Fatalf("expected signature_delta in stream body, got %q", body)
+	}
+	if strings.Index(body, `"type":"signature_delta"`) > strings.Index(body, `event: content_block_stop`) {
+		t.Fatalf("expected signature_delta before content_block_stop, got %q", body)
+	}
+}
+
+func TestHandleClaudeStreamSetsConnectionClose(t *testing.T) {
+	originalCall := callKiroAPI
+	callKiroAPI = func(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+		callback.OnText("ok", false)
+		callback.OnComplete(5, 1)
+		return nil
+	}
+	defer func() { callKiroAPI = originalCall }()
+
+	cfgFile, err := os.CreateTemp("", "kiro-config-*.json")
+	if err != nil {
+		t.Fatalf("create temp config: %v", err)
+	}
+	if _, err := cfgFile.WriteString(`{"password":"test","port":8080,"host":"127.0.0.1","requireApiKey":false,"accounts":[]}`); err != nil {
+		t.Fatalf("seed temp config: %v", err)
+	}
+	cfgFile.Close()
+	defer os.Remove(cfgFile.Name())
+	if err := config.Init(cfgFile.Name()); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	h := &Handler{
+		pool:        pool.GetPool(),
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	rec := httptest.NewRecorder()
+
+	h.handleClaudeStream(
+		rec,
+		&KiroPayload{},
+		"claude-opus-4-7",
+		false,
+		12,
+		nil,
+	)
+
+	if got := rec.Header().Get("Connection"); got != "close" {
+		t.Fatalf("expected Connection close, got %q (req=%v)", got, req.URL)
 	}
 }
 
