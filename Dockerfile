@@ -6,13 +6,10 @@ ARG TARGETARCH
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o kiro-go .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o kiro-go .
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
@@ -23,6 +20,4 @@ COPY --from=builder /app/web ./web
 RUN mkdir -p /app/data
 
 EXPOSE 8080
-VOLUME /app/data
-
 CMD ["./kiro-go"]
