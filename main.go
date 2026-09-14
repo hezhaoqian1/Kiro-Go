@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -58,7 +59,18 @@ func main() {
 	handler := proxy.NewHandler()
 
 	// 启动服务器
-	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
+	host := config.GetHost()
+	if envHost := os.Getenv("HOST"); envHost != "" {
+		host = envHost
+	}
+	port := config.GetPort()
+	// Railway and other PaaS providers inject the port at runtime.
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if parsed, err := strconv.Atoi(envPort); err == nil && parsed > 0 && parsed <= 65535 {
+			port = parsed
+		}
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
 	logger.Infof("Admin panel: http://%s/admin", addr)
 	logger.Infof("Claude API: http://%s/v1/messages", addr)
