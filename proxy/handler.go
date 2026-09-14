@@ -1607,12 +1607,22 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			if ctx.Err() != nil {
 				return
 			}
-			lastErr = err
-			excluded[account.ID] = true
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			// Some Kiro profiles close a complete non-stream response without
+			// emitting a stop reason. The buffered body is still usable; only
+			// reject integrity failures when nothing was returned at all.
+			if isStreamIntegrityError(err) && (content != "" || len(toolUses) > 0 || thinkingContent != "") {
+				err = nil
 			}
-			continue
+			if err == nil {
+				// Continue with the buffered response below.
+			} else {
+				lastErr = err
+				excluded[account.ID] = true
+				if !isStreamIntegrityError(err) {
+					h.handleAccountFailure(account, err)
+				}
+				continue
+			}
 		}
 
 		thinkingFormat := thinkingOpts.Format
@@ -2234,13 +2244,20 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			if ctx.Err() != nil {
 				return
 			}
-			lastErr = err
-			excluded[account.ID] = true
-			// Integrity failures are upstream hiccups, not account faults.
-			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+			if isStreamIntegrityError(err) && (content != "" || len(toolUses) > 0 || reasoningContent != "") {
+				err = nil
 			}
-			continue
+			if err == nil {
+				// Continue with the buffered response below.
+			} else {
+				lastErr = err
+				excluded[account.ID] = true
+				// Integrity failures are upstream hiccups, not account faults.
+				if !isStreamIntegrityError(err) {
+					h.handleAccountFailure(account, err)
+				}
+				continue
+			}
 		}
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
