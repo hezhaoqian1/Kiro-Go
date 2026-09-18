@@ -1310,6 +1310,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			if ctx.Err() != nil {
 				return
 			}
+
+			bufferedText, _ := extractThinkingFromContent(rawContentBuilder.String())
+			if isStreamIntegrityError(err) && !messageStarted && !inThinkingBlock &&
+				strings.TrimSpace(bufferedText) != "" {
+				upstreamStopReason = "end_turn"
+				err = nil
+			}
+		}
+		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			if !isStreamIntegrityError(err) {

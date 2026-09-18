@@ -115,6 +115,12 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
 
+## Claude Streaming Compatibility
+
+When `/v1/messages` reaches a clean upstream EOF without `stopReason`, bounded integrity retries still run first. After those retries, a buffered response is completed with `end_turn` only if no SSE has been sent, non-empty answer text is present, and no thinking block remains open. This accommodates short replies from some Kiro profiles, including connectivity probes.
+
+This is a compatibility heuristic, not proof that an answer is semantically complete. Already-started streams, reasoning-only or whitespace responses, transport failures, and corrupt event frames still fail. A successful short probe does not guarantee long-answer compatibility. OpenAI and non-streaming behavior are unchanged by this fix.
+
 ## Outbound Proxy
 
 For users in restricted network regions, configure an outbound proxy in the admin panel under **Settings - Outbound Proxy Settings**. Supports SOCKS5 and HTTP proxies.

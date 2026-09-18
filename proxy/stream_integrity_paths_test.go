@@ -90,6 +90,81 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	}
 }
 
+func TestClaudeStreamAcceptsBufferedResponseWithoutStopReason(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "short answer",
+		}))
+	}))
+	defer server.Close()
+	h := setupIntegrityPathTest(t, server)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-opus-5-thinking",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "short answer") {
+		t.Fatalf("expected buffered content, got %s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("expected implicit end_turn, got %s", body)
+	}
+	if strings.Contains(body, `"type":"error"`) {
+		t.Fatalf("buffered response must not fail, got %s", body)
+	}
+	if hits.Load() != 1+maxSameAccountStreamRetries {
+		t.Fatalf("expected bounded integrity retries before accepting response, hits=%d", hits.Load())
+	}
+	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("expected SSE success, got %d headers=%v", rec.Code, rec.Header())
+	}
+	if strings.Count(body, "short answer") != 1 || strings.Count(body, "event: message_stop\n") != 1 {
+		t.Fatalf("expected one answer and one terminal event, got %s", body)
+	}
+}
+
+func TestClaudeStreamRejectsUnusableBufferedResponse(t *testing.T) {
+	for _, scenario := range []struct {
+		name         string
+		eventType    string
+		payload      map[string]interface{}
+		partialFrame bool
+	}{
+		{name: "whitespace", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "   "}},
+		{name: "reasoning only", eventType: "reasoningContentEvent", payload: map[string]interface{}{"text": "thinking"}},
+		{name: "reasoning tags only", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>thinking</thinking>"}},
+		{name: "unfinished reasoning", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>unfinished"}},
+		{name: "partial frame after text", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "short answer"}, partialFrame: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write(awsEventStreamFrame(t, scenario.eventType, scenario.payload))
+				if scenario.partialFrame {
+					_, _ = w.Write([]byte{0, 0, 0})
+				}
+			}))
+			defer server.Close()
+			handler := setupIntegrityPathTest(t, server)
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-5-thinking","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`))
+			recorder := httptest.NewRecorder()
+			handler.handleClaudeMessages(recorder, request)
+			body := recorder.Body.String()
+			if !strings.Contains(body, `"type":"error"`) || strings.Contains(body, `"stop_reason":"end_turn"`) || strings.Contains(body, "event: message_stop\n") {
+				t.Fatalf("expected explicit failure without successful completion, got %s", body)
+			}
+		})
+	}
+}
+
 // Non-stream buffers everything, so a truncated first attempt is safe to retry
 // on the same account. The client must receive the recovered answer only.
 func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {

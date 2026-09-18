@@ -115,6 +115,12 @@ API Key 账号会走 Kiro CLI runtime（`https://runtime.{region}.kiro.dev/`）�
 
 在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
+## Claude 流式兼容边界
+
+当 `/v1/messages` 的上游正常 EOF 但缺少 `stopReason` 时，代理仍先执行有界重试。重试耗尽后，仅对尚未发送任何 SSE、包含非空回答文本且不处于未结束思考块中的缓冲响应补充 `end_turn`。这兼容了部分 Kiro profile 的短回答（包括账号连通性测试）。
+
+该回退是兼容性判断，并不能证明回答在语义上完整。已经开始输出的流、纯思考、空白响应、传输错误和损坏事件帧仍然报错；短回答测试通过不代表所有长回答均可用。本次变更不改变 OpenAI 协议或非流式处理行为。
+
 ## 出站代理
 
 可在管理面板「设置 - 出站代理设置」中配置代理。支持 SOCKS5 和 HTTP 代理。
