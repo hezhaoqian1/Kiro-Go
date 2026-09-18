@@ -57,9 +57,9 @@ func truncatedUpstream(t *testing.T, hits *atomic.Int32) *httptest.Server {
 	}))
 }
 
-// A truncated stream whose content already reached the client must end with an
-// SSE error, never with a forged end_turn that tells the client it is done.
-func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
+// A clean EOF after answer text is treated as an implicit end_turn because
+// Kiro API-key runtime responses can omit metadata.stopReason.
+func TestClaudeStreamCompletesTextAfterMissingStopReason(t *testing.T) {
 	var hits atomic.Int32
 	server := truncatedUpstream(t, &hits)
 	defer server.Close()
@@ -78,13 +78,13 @@ func TestClaudeStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 	if !strings.Contains(body, "partial answer") {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
-	if strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Fatalf("truncated stream must not be reported as end_turn, got %s", body)
+	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Fatalf("expected implicit end_turn, got %s", body)
 	}
-	if !strings.Contains(body, `"type":"error"`) {
-		t.Fatalf("expected SSE error event, got %s", body)
+	if strings.Contains(body, `"type":"error"`) || !strings.Contains(body, "event: message_stop\n") {
+		t.Fatalf("expected successful terminal event, got %s", body)
 	}
-	// Content was already flushed, so reissuing would duplicate output.
+	// Content was already flushed, so no integrity retry is safe or needed.
 	if hits.Load() != 1 {
 		t.Fatalf("must not retry after client flush, hits=%d", hits.Load())
 	}

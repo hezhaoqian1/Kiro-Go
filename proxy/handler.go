@@ -1312,7 +1312,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 
 			bufferedText, _ := extractThinkingFromContent(rawContentBuilder.String())
-			if isStreamIntegrityError(err) && !messageStarted && !inThinkingBlock &&
+			if isStreamIntegrityError(err) && !inThinkingBlock &&
 				strings.TrimSpace(bufferedText) != "" {
 				upstreamStopReason = "end_turn"
 				err = nil
