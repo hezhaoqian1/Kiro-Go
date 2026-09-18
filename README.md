@@ -115,11 +115,13 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
 
+Claude requests honor an explicit `thinking.budget_tokens` when constructing the upstream thinking prompt. Without one, the default is 8192, capped at half of `max_tokens` when provided to leave room for the answer. Token counting uses the same prompt. These are upstream prompt hints, not a guarantee of latency or of exposed reasoning content.
+
 ## Claude Streaming Compatibility
 
-When `/v1/messages` reaches a clean upstream EOF without `stopReason`, bounded integrity retries still run first. After those retries, a buffered response is completed with `end_turn` only if no SSE has been sent, non-empty answer text is present, and no thinking block remains open. This accommodates short replies from some Kiro profiles, including connectivity probes.
+When `/v1/messages` reaches a clean upstream EOF without `stopReason`, bounded integrity retries run only while no answer or thinking SSE has been sent. If retries are exhausted or output has already started, a response with non-empty answer text is completed with `end_turn` if no tag-delimited thinking block remains open. An already-started response is never retried, avoiding duplicate visible output. This accommodates replies from some Kiro profiles, including connectivity probes.
 
-This is a compatibility heuristic, not proof that an answer is semantically complete. Already-started streams, reasoning-only or whitespace responses, transport failures, and corrupt event frames still fail. A successful short probe does not guarantee long-answer compatibility. OpenAI and non-streaming behavior are unchanged by this fix.
+This is a compatibility heuristic, not proof that an answer is semantically complete. Reasoning-only or whitespace responses without a terminal signal, transport failures, and corrupt event frames still fail, including after output has started. A successful short probe does not guarantee long-answer compatibility. OpenAI and non-streaming EOF behavior are unchanged by this fix.
 
 ## Outbound Proxy
 

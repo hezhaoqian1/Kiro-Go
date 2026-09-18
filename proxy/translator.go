@@ -42,6 +42,19 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+func claudeThinkingPrompt(req *ClaudeRequest) string {
+	budget := 8192
+	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
+		budget = req.Thinking.BudgetTokens
+	} else if req.MaxTokens > 0 {
+		budget = min(budget, max(1, req.MaxTokens/2))
+	}
+	if req.MaxTokens > 0 && budget >= req.MaxTokens {
+		budget = max(1, req.MaxTokens-1)
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
+}
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -206,7 +219,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	origin := "AI_EDITOR"
 
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req, thinking)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -348,16 +361,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
-	systemPrompt := extractSystemPrompt(system)
+func buildClaudeSystemPrompt(req *ClaudeRequest, thinking bool) string {
+	systemPrompt := extractSystemPrompt(req.System)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return claudeThinkingPrompt(req)
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return claudeThinkingPrompt(req) + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -536,13 +549,12 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 
 	cloned := *req
 	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+		cloned.System = prependThinkingSystem(req.System, claudeThinkingPrompt(req))
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func prependThinkingSystem(system interface{}, thinkingText string) interface{} {
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}

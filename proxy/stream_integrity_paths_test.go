@@ -144,6 +144,8 @@ func TestClaudeStreamRejectsUnusableBufferedResponse(t *testing.T) {
 		{name: "reasoning tags only", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>thinking</thinking>"}},
 		{name: "unfinished reasoning", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>unfinished"}},
 		{name: "partial frame after text", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "short answer"}, partialFrame: true},
+		{name: "partial frame after flushed text", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": strings.Repeat("long answer ", 12)}, partialFrame: true},
+		{name: "unfinished flushed reasoning", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>" + strings.Repeat("still thinking ", 12)}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +169,46 @@ func TestClaudeStreamRejectsUnusableBufferedResponse(t *testing.T) {
 
 // Non-stream buffers everything, so a truncated first attempt is safe to retry
 // on the same account. The client must receive the recovered answer only.
+func TestClaudeStreamThinkingAndToolCompletionWithoutStopReason(t *testing.T) {
+	for _, scenario := range []struct {
+		name       string
+		eventType  string
+		payload    map[string]interface{}
+		answer     string
+		stopReason string
+	}{
+		{name: "native reasoning then answer", eventType: "reasoningContentEvent", payload: map[string]interface{}{"text": "reasoning"}, answer: "finished answer", stopReason: "end_turn"},
+		{name: "tag reasoning then answer", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>" + strings.Repeat("reasoning ", 12) + "</thinking>"}, answer: "finished answer", stopReason: "end_turn"},
+		{name: "tool use", eventType: "toolUseEvent", payload: map[string]interface{}{"toolUseId": "toolu_1", "name": "lookup", "input": `{"query":"test"}`, "stop": true}, stopReason: "tool_use"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var hits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				hits.Add(1)
+				_, _ = writer.Write(awsEventStreamFrame(t, scenario.eventType, scenario.payload))
+				if scenario.answer != "" {
+					_, _ = writer.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": scenario.answer}))
+				}
+			}))
+			defer server.Close()
+			handler := setupIntegrityPathTest(t, server)
+			request := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", strings.NewReader(`{"model":"claude-sonnet-5-thinking","max_tokens":1024,"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"stream":true}`))
+			recorder := httptest.NewRecorder()
+			handler.handleClaudeMessages(recorder, request)
+			body := recorder.Body.String()
+			if strings.Contains(body, "event: error\n") || !strings.Contains(body, `"stop_reason":"`+scenario.stopReason+`"`) {
+				t.Fatalf("expected completion, got %s", body)
+			}
+			if strings.Count(body, "event: message_stop\n") != 1 || hits.Load() != 1 {
+				t.Fatalf("expected one attempt and one completion, hits=%d body=%s", hits.Load(), body)
+			}
+			if strings.Count(body, "event: content_block_start\n") != strings.Count(body, "event: content_block_stop\n") {
+				t.Fatalf("unclosed content blocks: %s", body)
+			}
+		})
+	}
+}
+
 func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

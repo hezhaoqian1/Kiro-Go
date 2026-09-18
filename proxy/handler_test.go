@@ -307,6 +307,35 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 	}
 }
 
+func TestClaudeThinkingBudgetMatchesRequest(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		maxTokens int
+		thinking  *ClaudeThinkingConfig
+		want      string
+	}{
+		{name: "default", want: "<max_thinking_length>8192</max_thinking_length>"},
+		{name: "short probe", maxTokens: 1024, want: "<max_thinking_length>512</max_thinking_length>"},
+		{name: "explicit budget", maxTokens: 4096, thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048}, want: "<max_thinking_length>2048</max_thinking_length>"},
+		{name: "adaptive", maxTokens: 4096, thinking: &ClaudeThinkingConfig{Type: "adaptive"}, want: "<max_thinking_length>2048</max_thinking_length>"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			request := &ClaudeRequest{Model: "claude-sonnet-5", MaxTokens: scenario.maxTokens, Thinking: scenario.thinking, Messages: []ClaudeMessage{{Role: "user", Content: "hi"}}}
+			prompt := ClaudeToKiro(request, true).ConversationState.History[0].UserInputMessage.Content
+			if !strings.Contains(prompt, scenario.want) {
+				t.Fatalf("upstream budget mismatch: %s", prompt)
+			}
+			countPrompt := extractSystemPrompt(cloneClaudeRequestForThinking(request, true).System)
+			if !strings.Contains(countPrompt, scenario.want) {
+				t.Fatalf("token counting budget mismatch: %s", countPrompt)
+			}
+			if request.System != nil {
+				t.Fatal("original request mutated")
+			}
+		})
+	}
+}
+
 func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *testing.T) {
 	req := &ClaudeRequest{
 		Model:  "claude-sonnet-4.6",
@@ -322,7 +351,7 @@ func TestCloneClaudeRequestForThinkingInjectsPromptWithoutMutatingOriginal(t *te
 		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
 	}
 	gotPrompt := extractSystemPrompt(cloned.System)
-	expected := ThinkingModePrompt + "\n\nFollow the user instructions."
+	expected := claudeThinkingPrompt(req) + "\n\nFollow the user instructions."
 	if gotPrompt != expected {
 		t.Fatalf("expected injected system prompt %q, got %q", expected, gotPrompt)
 	}
@@ -355,7 +384,7 @@ func TestCloneClaudeRequestForThinkingPreservesStructuredSystemBlocks(t *testing
 		t.Fatalf("expected 2 system blocks after prepend, got %d", len(blocks))
 	}
 	first, ok := blocks[0].(map[string]interface{})
-	if !ok || first["text"] != ThinkingModePrompt+"\n" {
+	if !ok || first["text"] != claudeThinkingPrompt(req)+"\n" {
 		t.Fatalf("expected first block to be thinking prompt, got %#v", blocks[0])
 	}
 	second, ok := blocks[1].(map[string]interface{})
