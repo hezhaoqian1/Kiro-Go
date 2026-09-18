@@ -215,6 +215,21 @@ type KiroToolWrapper struct {
 		Description string      `json:"description"`
 		InputSchema InputSchema `json:"inputSchema"`
 	} `json:"toolSpecification"`
+	CachePoint *KiroCachePoint `json:"cachePoint,omitempty"`
+}
+
+func (wrapper KiroToolWrapper) MarshalJSON() ([]byte, error) {
+	if wrapper.CachePoint != nil &&
+		wrapper.ToolSpecification.Name == "" &&
+		wrapper.ToolSpecification.Description == "" &&
+		wrapper.ToolSpecification.InputSchema.JSON == nil {
+		return json.Marshal(struct {
+			CachePoint *KiroCachePoint `json:"cachePoint"`
+		}{CachePoint: wrapper.CachePoint})
+	}
+
+	type wireKiroToolWrapper KiroToolWrapper
+	return json.Marshal(wireKiroToolWrapper(wrapper))
 }
 
 type InputSchema struct {
@@ -241,6 +256,11 @@ type KiroImage struct {
 type KiroHistoryMessage struct {
 	UserInputMessage         *KiroUserInputMessage         `json:"userInputMessage,omitempty"`
 	AssistantResponseMessage *KiroAssistantResponseMessage `json:"assistantResponseMessage,omitempty"`
+	CachePoint               *KiroCachePoint               `json:"cachePoint,omitempty"`
+}
+
+type KiroCachePoint struct {
+	Type string `json:"type"`
 }
 
 type KiroAssistantResponseMessage struct {
@@ -272,6 +292,7 @@ type KiroStreamCallback struct {
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
 	OnStopReason   func(reason string)
+	OnCacheUsage   func(usage promptCacheUsage)
 }
 
 // ==================== API Call ====================
@@ -603,6 +624,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var inputTokens, outputTokens int
 	var totalCredits float64
 	var contextUsagePercentages []float64
+	var cacheUsage promptCacheUsage
 	var sawOutput bool
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
@@ -669,6 +691,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		cacheUsage = mergePromptCacheUsage(cacheUsage, promptCacheUsageFromEvent(event))
 
 		switch headers[":event-type"] {
 		case "assistantResponseEvent":
@@ -742,6 +765,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
+	if callback.OnCacheUsage != nil {
+		callback.OnCacheUsage(cacheUsage)
+	}
 	return emitted, nil
 }
 
@@ -796,6 +822,41 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	}
 
 	return inputTokens, outputTokens
+}
+
+func promptCacheUsageFromEvent(event map[string]interface{}) promptCacheUsage {
+	candidates := []map[string]interface{}{event}
+	collectUsageMaps(event, &candidates)
+	var usage promptCacheUsage
+	for _, candidate := range candidates {
+		usage.CacheReadInputTokens = maxInt(usage.CacheReadInputTokens, readUsageNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens"))
+		usage.CacheCreationInputTokens = maxInt(usage.CacheCreationInputTokens, readUsageNumber(candidate, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteInputTokens", "cache_write_input_tokens"))
+		usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(candidate, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
+		usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(candidate, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
+		if nested, ok := candidate["cacheCreation"].(map[string]interface{}); ok {
+			usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(nested, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
+			usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(nested, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
+		}
+		if nested, ok := candidate["cache_creation"].(map[string]interface{}); ok {
+			usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(nested, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
+			usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(nested, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
+		}
+	}
+	return usage
+}
+
+func readUsageNumber(values map[string]interface{}, keys ...string) int {
+	value, _ := readTokenNumber(values, keys...)
+	return value
+}
+
+func mergePromptCacheUsage(current, incoming promptCacheUsage) promptCacheUsage {
+	return promptCacheUsage{
+		CacheCreationInputTokens:   maxInt(current.CacheCreationInputTokens, incoming.CacheCreationInputTokens),
+		CacheReadInputTokens:       maxInt(current.CacheReadInputTokens, incoming.CacheReadInputTokens),
+		CacheCreation5mInputTokens: maxInt(current.CacheCreation5mInputTokens, incoming.CacheCreation5mInputTokens),
+		CacheCreation1hInputTokens: maxInt(current.CacheCreation1hInputTokens, incoming.CacheCreation1hInputTokens),
+	}
 }
 
 // getContextWindowSize returns the context window size (in tokens) for a model.

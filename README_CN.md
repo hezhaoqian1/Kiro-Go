@@ -113,11 +113,17 @@ API Key 账号会走 Kiro CLI runtime（`https://runtime.{region}.kiro.dev/`）�
 
 ## 思考模式
 
-在模型名后加后缀（默认 `-thinking`）即可启用，例如 `claude-sonnet-4.5-thinking`。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。输出格式可在管理面板「设置 - Thinking 模式」中配置。
+Thinking 设置中的「触发后缀」可以留空。留空后，直接使用基础模型名（例如 `claude-sonnet-5`）就会默认启用 thinking；填写 `-thinking` 等后缀后，则恢复为只有带后缀的模型名启用 thinking。Claude 兼容请求如果带有顶层 `thinking` 配置，例如 `{"type":"enabled","budget_tokens":2048}` 或 `{"type":"adaptive"}`，也会自动启用 thinking 模式。显式 `thinking.type=disabled` 仍然可以关闭本次请求。输出格式可在管理面板「设置 - Thinking 模式」中配置。
 
 模型能力统一由 `proxy/thinking_policy.go` 管理，三个协议共用。旧模型使用 enabled + budget 提示；Sonnet/Opus 4.6 及能力表中的后续模型默认 adaptive + medium effort。Claude 的 `output_config.effort`、Chat Completions 的 `reasoning_effort`、Responses 的 `reasoning.effort` 映射到相同策略。仅对能力表支持的模型发送 `additionalModelRequestFields.output_config.effort`；不支持的模型/模式/effort 返回 400，未知模型不会自动生成 thinking 变体。
 
 显式 `thinking.type=disabled` 优先于模型后缀。enabled 模式遵循显式 `thinking.budget_tokens`；未指定时默认 8192，提供 `max_tokens` 时默认预算不超过它的一半。adaptive 模式使用 effort，不套用固定 200000 预算。Token 计数使用同一套提示。这是 Kiro 兼容策略，不代表已验证所有账号都支持原生 thinking，也不保证延迟或可见思考内容。
+
+## Prompt Cache
+
+Claude 请求中的 `cache_control` 会尽可能转换为 Kiro 原生 `cachePoint`：工具定义后的缓存断点会插入 `userInputMessageContext.tools`，历史消息最后一个带缓存控制的内容块后会插入历史 `cachePoint`。系统提示目前只按原文发送，不伪造 Kiro 不支持的系统级缓存断点。
+
+代理不会根据本地 fingerprint、账号或 TTL 猜测缓存命中。只有 Kiro 上游实际返回缓存 usage 时，Claude 响应才会带 `cache_read_input_tokens`、`cache_creation_input_tokens` 和对应的 5 分钟/1 小时明细；没有上游 usage 就不会报告缓存命中。Kiro 账号、区域或接口不返回这些字段时，说明当前请求无法确认发生了真实缓存命中。
 
 ## 共享流式链路与完整性
 

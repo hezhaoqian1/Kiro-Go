@@ -534,6 +534,17 @@ func TestParseModelAndThinking(t *testing.T) {
 	}
 }
 
+func TestParseModelAndThinkingEmptySuffixKeepsLegacyAlias(t *testing.T) {
+	model, thinking := ParseModelAndThinking("claude-sonnet-5", "")
+	if model != "claude-sonnet-5" || thinking {
+		t.Fatalf("base model must remain neutral in the parser: model=%q thinking=%v", model, thinking)
+	}
+	model, thinking = ParseModelAndThinking("claude-sonnet-5-thinking", "")
+	if model != "claude-sonnet-5" || !thinking {
+		t.Fatalf("legacy thinking alias must remain accepted: model=%q thinking=%v", model, thinking)
+	}
+}
+
 func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	// Guards the \b boundary in claudeVersionPattern: without it, the regex would
 	// rewrite "claude-sonnet-4-20250514" to "claude-sonnet-4.20250514" before the

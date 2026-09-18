@@ -109,6 +109,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	thinking = thinking || (thinkingCfg.Suffix == "" && modelSupportsThinking(actualModel))
 	if req.Reasoning != nil {
 		openaiReq.ReasoningEffort = strings.ToLower(strings.TrimSpace(req.Reasoning.Effort))
 		thinking = thinking || openaiReq.ReasoningEffort != ""

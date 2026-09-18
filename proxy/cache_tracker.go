@@ -510,6 +510,11 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
+func hasPromptCacheUsage(usage promptCacheUsage) bool {
+	return usage.CacheCreationInputTokens > 0 || usage.CacheReadInputTokens > 0 ||
+		usage.CacheCreation5mInputTokens > 0 || usage.CacheCreation1hInputTokens > 0
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),

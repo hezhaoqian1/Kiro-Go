@@ -292,11 +292,36 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 			wantModel:    "claude-sonnet-4.5",
 			wantThinking: false,
 		},
+		{
+			name:         "empty suffix enables base model",
+			model:        "claude-sonnet-5",
+			thinking:     nil,
+			wantModel:    "claude-sonnet-5",
+			wantThinking: true,
+		},
+		{
+			name:         "empty suffix still honors explicit disabled",
+			model:        "claude-sonnet-5",
+			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
+			wantModel:    "claude-sonnet-5",
+			wantThinking: false,
+		},
+		{
+			name:         "empty suffix leaves unknown model unchanged",
+			model:        "some-other-model",
+			thinking:     nil,
+			wantModel:    "some-other-model",
+			wantThinking: false,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotModel, gotThinking := resolveClaudeThinkingMode(tc.model, tc.thinking, "-thinking")
+			suffix := "-thinking"
+			if strings.Contains(tc.name, "empty suffix") {
+				suffix = ""
+			}
+			gotModel, gotThinking := resolveClaudeThinkingMode(tc.model, tc.thinking, suffix)
 			if gotModel != tc.wantModel {
 				t.Fatalf("expected model %q, got %q", tc.wantModel, gotModel)
 			}

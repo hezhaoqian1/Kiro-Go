@@ -185,7 +185,7 @@ type Config struct {
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
-	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
+	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode; empty means base models think by default
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
 
@@ -1080,9 +1080,6 @@ func GetThinkingConfig() ThinkingConfig {
 	defer cfgLock.RUnlock()
 
 	suffix := cfg.ThinkingSuffix
-	if suffix == "" {
-		suffix = "-thinking"
-	}
 	openaiFormat := cfg.OpenAIThinkingFormat
 	if openaiFormat == "" {
 		openaiFormat = "reasoning_content"

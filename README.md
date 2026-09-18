@@ -113,11 +113,17 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 ## Thinking Mode
 
-Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
+The Thinking settings' trigger suffix may be left empty. When empty, base model names such as `claude-sonnet-5` enable Thinking by default; setting `-thinking` restores the compatibility behavior where only suffixed names enable it. Claude-compatible requests with a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable Thinking. Explicit `thinking.type=disabled` still disables it for that request. Configure output format in the admin panel under Settings - Thinking Mode.
 
 All three protocols share the capability table in `proxy/thinking_policy.go`. Older models use enabled/budget prompts; Sonnet/Opus 4.6 and later entries in that table default to adaptive/medium effort. Claude `output_config.effort`, Chat Completions `reasoning_effort`, and Responses `reasoning.effort` map to the same policy. Only allowlisted models receive `additionalModelRequestFields.output_config.effort`. Unsupported model/mode/effort combinations return 400; unknown models are not automatically advertised with thinking variants.
 
 Explicit `thinking.type=disabled` overrides the suffix. Enabled mode honors an explicit budget; otherwise it uses 8192, capped at half of `max_tokens` when provided. Adaptive mode uses effort instead of a fixed 200000 budget. Token counting uses the same prompt. This is a Kiro compatibility policy, not proof of native thinking support for every account or a guarantee of latency or exposed reasoning.
+
+## Prompt Cache
+
+Claude `cache_control` directives are converted to Kiro-native `cachePoint` entries where the upstream shape supports them: after cached tool definitions in `userInputMessageContext.tools`, and after the last cached content block in historical messages. System prompts are sent as text; the proxy does not fabricate a Kiro system-level cache point that Kiro does not expose.
+
+The proxy does not infer cache hits from local fingerprints, account IDs, or TTLs. Claude cache usage fields (`cache_read_input_tokens`, `cache_creation_input_tokens`, and the 5-minute/1-hour breakdown) are returned only when Kiro actually sends corresponding upstream usage. If the Kiro account, region, or endpoint does not return those fields, the request cannot be reported as a confirmed cache hit.
 
 ## Shared Streaming and Completion Policy
 

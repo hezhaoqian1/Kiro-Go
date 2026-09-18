@@ -990,7 +990,7 @@
                 <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
                 <div class="form-group">
                     <label data-i18n="settings.thinkingSuffix"></label>
-                    <input type="text" id="thinkingSuffix" placeholder="-thinking">
+                    <input type="text" id="thinkingSuffix" data-i18n-placeholder="settings.thinkingSuffixPlaceholder">
                     <small style="color:#64748b;font-size:12px;margin-top:4px;display:block"
                         data-i18n="settings.thinkingSuffixHint"></small>
                 </div>
@@ -1222,7 +1222,7 @@
                 'settings.overUsageSaved': '超额使用设置已保存',
                 'settings.thinkingSettings': 'Thinking 模式设置',
                 'settings.thinkingSuffix': '触发后缀',
-                'settings.thinkingSuffixHint': '模型名称加此后缀即启用思考模式，如 claude-sonnet-4.5-thinking',
+                'settings.thinkingSuffixHint': '留空则直接使用基础模型名并默认开启 Thinking；填写后缀后，只有带后缀的模型名启用思考，例如 claude-sonnet-4.5-thinking',
                 'settings.openaiFormat': 'OpenAI API 输出格式',
                 'settings.claudeFormat': 'Claude API 输出格式',
                 'settings.noTag': '直接输出 (无标签)',
@@ -1522,7 +1522,7 @@
                 'settings.overUsageSaved': 'Over-usage settings saved',
                 'settings.thinkingSettings': 'Thinking Mode Settings',
                 'settings.thinkingSuffix': 'Trigger Suffix',
-                'settings.thinkingSuffixHint': 'Add this suffix to model name to enable thinking mode, e.g. claude-sonnet-4.5-thinking',
+                'settings.thinkingSuffixHint': 'Leave empty to enable Thinking for base model names; when set, only names with this suffix enable it, e.g. claude-sonnet-4.5-thinking',
                 'settings.openaiFormat': 'OpenAI API Output Format',
                 'settings.claudeFormat': 'Claude API Output Format',
                 'settings.noTag': 'Direct output (no tag)',
@@ -2515,14 +2515,14 @@
         async function loadThinkingConfig() {
             const res = await fetch('/admin/api/thinking', { headers: { 'X-Admin-Password': password } });
             const d = await res.json();
-            document.getElementById('thinkingSuffix').value = d.suffix || '-thinking';
+            document.getElementById('thinkingSuffix').value = d.suffix || '';
             document.getElementById('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
             document.getElementById('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
         }
         async function saveThinkingConfig() {
             const res = await fetch('/admin/api/thinking', {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Password': password },
-                body: JSON.stringify({ suffix: document.getElementById('thinkingSuffix').value || '-thinking', openaiFormat: document.getElementById('openaiThinkingFormat').value, claudeFormat: document.getElementById('claudeThinkingFormat').value })
+                body: JSON.stringify({ suffix: document.getElementById('thinkingSuffix').value.trim(), openaiFormat: document.getElementById('openaiThinkingFormat').value, claudeFormat: document.getElementById('claudeThinkingFormat').value })
             });
             const d = await res.json();
             if (d.success) { alert(t('settings.thinkingSaved')); } else { alert(t('common.saveFailed') + ': ' + d.error); }

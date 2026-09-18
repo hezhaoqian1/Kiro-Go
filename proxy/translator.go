@@ -70,11 +70,18 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
 
-	// Strip the configured thinking suffix (e.g. "-thinking") if present.
+	// Strip the configured thinking suffix if present. An empty configured suffix
+	// means base models default to thinking, but the historical -thinking alias
+	// remains accepted for clients that have not changed their model name yet.
 	suffixLower := strings.ToLower(thinkingSuffix)
+	suffix := thinkingSuffix
+	if suffixLower == "" {
+		suffixLower = "-thinking"
+		suffix = "-thinking"
+	}
 	if strings.HasSuffix(lower, suffixLower) {
 		thinking = true
-		model = model[:len(model)-len(thinkingSuffix)]
+		model = model[:len(model)-len(suffix)]
 		lower = strings.ToLower(model)
 	}
 
@@ -104,7 +111,7 @@ func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, 
 	if thinkingCfg != nil && strings.EqualFold(strings.TrimSpace(thinkingCfg.Type), "disabled") {
 		return actualModel, false
 	}
-	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+	return actualModel, suffixThinking || (thinkingSuffix == "" && modelSupportsThinking(actualModel)) || isClaudeThinkingRequested(thinkingCfg)
 }
 
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
@@ -169,10 +176,11 @@ type ImageSource struct {
 type ClaudeTool struct {
 	// Type is set for Anthropic server tools (e.g. "web_search_20250305").
 	// Regular client tools leave this empty.
-	Type        string      `json:"type,omitempty"`
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
+	Type         string                 `json:"type,omitempty"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  interface{}            `json:"input_schema"`
+	CacheControl map[string]interface{} `json:"cache_control,omitempty"`
 	// MaxUses is optional (native web_search). Ignored by Kiro conversion.
 	MaxUses int `json:"max_uses,omitempty"`
 }
@@ -246,6 +254,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				history = append(history, KiroHistoryMessage{
 					UserInputMessage: &userMsg,
 				})
+				appendClaudeHistoryCachePoint(&history, msg.Content)
 			}
 		} else if msg.Role == "assistant" {
 			content, toolUses := extractClaudeAssistantContent(msg.Content)
@@ -255,6 +264,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 					ToolUses: toolUses,
 				},
 			})
+			appendClaudeHistoryCachePoint(&history, msg.Content)
 		}
 	}
 
@@ -824,6 +834,9 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		w.ToolSpecification.Description = normalizeToolDesc(desc, sanitized)
 		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
 		result = append(result, w)
+		if len(tool.CacheControl) > 0 {
+			result = append(result, newKiroToolCachePoint())
+		}
 	}
 
 	// Mixed-tools path: if the client declared native web_search alongside other
@@ -849,6 +862,34 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	}
 
 	return result, nameMap
+}
+
+func newKiroCachePoint() KiroHistoryMessage {
+	return KiroHistoryMessage{CachePoint: &KiroCachePoint{Type: "default"}}
+}
+
+func newKiroToolCachePoint() KiroToolWrapper {
+	return KiroToolWrapper{CachePoint: &KiroCachePoint{Type: "default"}}
+}
+
+func appendClaudeHistoryCachePoint(history *[]KiroHistoryMessage, content interface{}) {
+	if claudeContentHasCacheControl(content) {
+		*history = append(*history, newKiroCachePoint())
+	}
+}
+
+func claudeContentHasCacheControl(content interface{}) bool {
+	blocks := contentBlocksAsMaps(content)
+	if len(blocks) == 0 {
+		return false
+	}
+	_, ok := cacheControlMap(blocks[len(blocks)-1]["cache_control"])
+	return ok
+}
+
+func cacheControlMap(value interface{}) (map[string]interface{}, bool) {
+	control, ok := value.(map[string]interface{})
+	return control, ok && len(control) > 0
 }
 
 func hasNativeWebSearchInTools(tools []ClaudeTool) bool {
@@ -1498,7 +1539,11 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 	if len(history) == 0 {
 		return false
 	}
-	last := history[len(history)-1]
+	lastIndex := lastHistoryMessageIndex(history)
+	if lastIndex < 0 {
+		return false
+	}
+	last := history[lastIndex]
 	return last.AssistantResponseMessage != nil &&
 		toolResultsAnswerToolUses(last.AssistantResponseMessage.ToolUses, currentToolResultIDs)
 }
@@ -1621,7 +1666,11 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	// answered by the current message. If so, its structured toolUses stay.
 	activeIdx := -1
 	if len(currentToolResultIDs) > 0 {
-		last := history[len(history)-1]
+		lastIndex := lastHistoryMessageIndex(history)
+		if lastIndex < 0 {
+			return history
+		}
+		last := history[lastIndex]
 		if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
 			allCovered := true
 			for _, tu := range last.AssistantResponseMessage.ToolUses {
@@ -1631,13 +1680,16 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 				}
 			}
 			if allCovered {
-				activeIdx = len(history) - 1
+				activeIdx = lastIndex
 			}
 		}
 	}
 
 	for i := range history {
 		msg := &history[i]
+		if msg.CachePoint != nil {
+			continue
+		}
 
 		if msg.AssistantResponseMessage != nil {
 			// Scrub legacy tool-call narration that a polluted client may be
@@ -1694,6 +1746,10 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	cleaned := history[:0:0]
 	for i := range history {
 		msg := history[i]
+		if msg.CachePoint != nil {
+			cleaned = append(cleaned, msg)
+			continue
+		}
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
 			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
 			if c == "" || c == minimalFallbackUserContent {
@@ -1744,6 +1800,9 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	primingCount := 0
 	if hasPriming && len(history) >= 2 {
 		primingCount = 2
+		for primingCount < len(history) && history[primingCount].CachePoint != nil {
+			primingCount++
+		}
 	}
 
 	priming := history[:primingCount]
@@ -1815,10 +1874,19 @@ func historyEntryByteSize(entry KiroHistoryMessage) int {
 // dropLeadingAssistant removes a leading assistant message from a history tail so
 // it does not directly follow the placeholder user turn with a broken pairing.
 func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
-	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
+	for len(tail) > 0 && (tail[0].CachePoint != nil || tail[0].AssistantResponseMessage != nil) {
 		tail = tail[1:]
 	}
 	return tail
+}
+
+func lastHistoryMessageIndex(history []KiroHistoryMessage) int {
+	for index := len(history) - 1; index >= 0; index-- {
+		if history[index].CachePoint == nil {
+			return index
+		}
+	}
+	return -1
 }
 
 // payloadByteSize returns the serialized size of the payload in bytes.

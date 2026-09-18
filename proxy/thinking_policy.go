@@ -24,6 +24,10 @@ func modelThinkingCapability(model string) thinkingCapability {
 	}
 }
 
+func modelSupportsThinking(model string) bool {
+	return modelThinkingCapability(model).Mode != "unverified"
+}
+
 type ClaudeOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
 }

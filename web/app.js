@@ -1588,14 +1588,14 @@
   async function loadThinkingConfig() {
     const res = await api('/thinking');
     const d = await res.json();
-    $('thinkingSuffix').value = d.suffix || '-thinking';
+    $('thinkingSuffix').value = d.suffix || '';
     $('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
     $('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
   }
   async function saveThinkingConfig() {
     const res = await api('/thinking', {
       method: 'POST', body: JSON.stringify({
-        suffix: $('thinkingSuffix').value || '-thinking',
+        suffix: $('thinkingSuffix').value.trim(),
         openaiFormat: $('openaiThinkingFormat').value,
         claudeFormat: $('claudeThinkingFormat').value
       })
@@ -3478,7 +3478,7 @@
 
       for (const m of familyModels) {
         const id = m.id || '';
-        const isThinking = id.endsWith(thinkingSuffix);
+        const isThinking = m.thinking_default || !!m.thinking_capability || (thinkingSuffix && id.endsWith(thinkingSuffix));
         const supportsImage = m.supports_image || false;
 
         html += '<div class="model-item">';

@@ -63,6 +63,22 @@ func TestThinkingCapabilitiesRejectUnknownCombinations(t *testing.T) {
 	}
 }
 
+func TestEmptySuffixAdvertisesBaseModelsAsThinking(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{
+		{ModelId: "claude-sonnet-5"},
+		{ModelId: "unknown-model"},
+	}, "")
+	if len(models) != 2 {
+		t.Fatalf("empty suffix must not create duplicate model variants: %#v", models)
+	}
+	if models[0]["id"] != "claude-sonnet-5" || models[0]["thinking_default"] != true {
+		t.Fatalf("base model is not marked as default thinking: %#v", models[0])
+	}
+	if _, ok := models[1]["thinking_default"]; ok {
+		t.Fatalf("unknown model must not be marked thinking by default: %#v", models[1])
+	}
+}
+
 func TestThinkingValidationRunsBeforeUpstreamAcrossProtocols(t *testing.T) {
 	for _, scenario := range []struct{ path, body string }{
 		{"/v1/messages", `{"model":"claude-sonnet-4.5","max_tokens":4096,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"hi"}]}`},

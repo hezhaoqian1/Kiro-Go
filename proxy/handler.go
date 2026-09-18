@@ -520,9 +520,15 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 	if len(cached) > 0 {
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
+			base := buildModelInfo(m.ModelId, "anthropic", supportsImage)
+			models = append(models, base)
 			capability := modelThinkingCapability(m.ModelId)
-			if capability.Mode != "unverified" {
+			if thinkingSuffix == "" {
+				if capability.Mode != "unverified" {
+					base["thinking_default"] = true
+					base["thinking_capability"] = capability
+				}
+			} else if capability.Mode != "unverified" {
 				variant := buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage)
 				variant["thinking_capability"] = capability
 				models = append(models, variant)
@@ -533,22 +539,23 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 }
 
 func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+	ids := []string{"claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.7", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5", "claude-opus-4.5"}
+	models := make([]map[string]interface{}, 0, len(ids)*2)
+	for _, id := range ids {
+		model := buildModelInfo(id, "anthropic", true)
+		capability := modelThinkingCapability(id)
+		if thinkingSuffix == "" {
+			model["thinking_default"] = true
+			model["thinking_capability"] = capability
+			models = append(models, model)
+			continue
+		}
+		models = append(models, model)
+		variant := buildModelInfo(id+thinkingSuffix, "anthropic", true)
+		variant["thinking_capability"] = capability
+		models = append(models, variant)
 	}
+	return models
 }
 
 func modelSupportsImage(inputTypes []string) bool {
@@ -943,7 +950,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				"model":         model,
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, hasPromptCacheUsage(messageStartUsage)),
 			},
 		})
 		messageStarted = true
@@ -960,14 +967,14 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
-		messageStartUsage = cacheUsage
+		messageStartUsage = promptCacheUsage{}
 
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
 		var toolUses []KiroToolUse
 		var upstreamStopReason string
+		var cacheUsage promptCacheUsage
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1197,6 +1204,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
 			},
+			OnCacheUsage: func(usage promptCacheUsage) {
+				cacheUsage = mergePromptCacheUsage(cacheUsage, usage)
+			},
 		}
 
 		measure := func() (int, int, string, bool) {
@@ -1212,6 +1222,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			credits = 0
 			realInputTokens = 0
 			upstreamStopReason = ""
+			cacheUsage = promptCacheUsage{}
 			textBuffer = ""
 			thinkingStarted = false
 			eventThinkingOpen = false
@@ -1261,7 +1272,6 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses))
@@ -1272,7 +1282,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, hasPromptCacheUsage(cacheUsage)),
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1460,7 +1470,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		var cacheUsage promptCacheUsage
 
 		var content string
 		var thinkingContent string
@@ -1494,6 +1504,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
 			},
+			OnCacheUsage: func(usage promptCacheUsage) {
+				cacheUsage = mergePromptCacheUsage(cacheUsage, usage)
+			},
 		}
 
 		measure := func() (int, int, string, bool) {
@@ -1509,6 +1522,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			credits = 0
 			realInputTokens = 0
 			upstreamStopReason = ""
+			cacheUsage = promptCacheUsage{}
 		}
 
 		// Fully buffered: nothing reaches the client until the response is
@@ -1544,7 +1558,6 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		responseThinkingContent := rawThinkingContent
@@ -1569,7 +1582,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-		if cacheProfile != nil {
+		if hasPromptCacheUsage(cacheUsage) {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
@@ -1634,6 +1647,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	thinking = thinking || (thinkingCfg.Suffix == "" && modelSupportsThinking(actualModel))
 	req.ReasoningEffort = strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
 	thinking = thinking || req.ReasoningEffort != ""
 	if message := validateThinkingModel(actualModel, thinking, nil, req.ReasoningEffort); message != "" {
@@ -3992,6 +4006,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	// Build a minimal chat payload
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	thinking = thinking || (thinkingCfg.Suffix == "" && modelSupportsThinking(actualModel))
 
 	openaiReq := &OpenAIRequest{
 		Model:     actualModel,
