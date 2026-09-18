@@ -459,8 +459,8 @@ func TestResponsesStreamPreservesUpstreamIncompleteStatus(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"status":"incomplete"`) || !strings.Contains(rec.Body.String(), `"reason":"max_output_tokens"`) {
-		t.Fatalf("expected incomplete response.completed event, got %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "event: response.incomplete\n") || strings.Contains(rec.Body.String(), "event: response.completed\n") || !strings.Contains(rec.Body.String(), `"status":"incomplete"`) || !strings.Contains(rec.Body.String(), `"reason":"max_output_tokens"`) {
+		t.Fatalf("expected response.incomplete event, got %s", rec.Body.String())
 	}
 }
 

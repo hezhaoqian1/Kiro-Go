@@ -102,7 +102,6 @@ func GetClientForProxy(proxyURL string) *http.Client {
 		return cached.(*http.Client)
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -160,7 +159,6 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
@@ -176,7 +174,9 @@ func InitKiroHttpClient(proxyURL string) {
 
 // KiroPayload is the top-level request body sent to the Kiro API.
 type KiroPayload struct {
-	ConversationState struct {
+	ThinkingEnabled              bool                   `json:"-"`
+	AdditionalModelRequestFields map[string]interface{} `json:"additionalModelRequestFields,omitempty"`
+	ConversationState            struct {
 		AgentContinuationId string `json:"agentContinuationId,omitempty"`
 		AgentTaskType       string `json:"agentTaskType,omitempty"`
 		ChatTriggerType     string `json:"chatTriggerType"`
@@ -264,6 +264,7 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
+	OnActivity     func()
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
@@ -357,6 +358,8 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := streamLifetime(ctx)
+	defer cancel()
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -459,8 +462,12 @@ endpointLoop:
 			req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", streamAttempt, maxStreamAttemptsPerEndpoint))
 			req.Header.Set("Amz-Sdk-Invocation-Id", invocationID)
 
+			guard := newStreamGuard(ctx, payload.ThinkingEnabled, getStreamOptions())
+			req = req.WithContext(guard.Context)
 			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 			if err != nil {
+				err = guard.Result(err)
+				guard.Close()
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 				if !isRetryableStreamError(err) {
@@ -471,14 +478,20 @@ endpointLoop:
 
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
+				guard.Close()
 				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 				continue endpointLoop
 			}
 
 			if resp.StatusCode != 200 {
-				errBody, _ := io.ReadAll(resp.Body)
+				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				readErr = guard.Result(readErr)
 				resp.Body.Close()
+				guard.Close()
+				if readErr != nil {
+					return readErr
+				}
 				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
 				// Authentication errors and payment errors are not retried across endpoints.
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
@@ -488,8 +501,21 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			emitted, err := parseEventStreamTracked(resp.Body, callback)
+			tracked := KiroStreamCallback{}
+			if callback != nil {
+				tracked = *callback
+			}
+			originalActivity := tracked.OnActivity
+			tracked.OnActivity = func() {
+				guard.Activity()
+				if originalActivity != nil {
+					originalActivity()
+				}
+			}
+			emitted, err := parseNormalizedEventStream(guardedReader{Reader: resp.Body, guard: guard}, &tracked, payload.ThinkingEnabled)
+			err = guard.Result(err)
 			resp.Body.Close()
+			guard.Close()
 			if err == nil {
 				return nil
 			}
@@ -647,6 +673,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		switch headers[":event-type"] {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				if callback.OnActivity != nil {
+					callback.OnActivity()
+				}
 				sawOutput = true
 				if callback.OnText != nil {
 					emitted = true
@@ -655,6 +684,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				if callback.OnActivity != nil {
+					callback.OnActivity()
+				}
 				sawOutput = true
 				if callback.OnText != nil {
 					emitted = true
@@ -662,6 +694,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				}
 			}
 		case "toolUseEvent":
+			if callback.OnActivity != nil {
+				callback.OnActivity()
+			}
 			if toolErr := handleToolUseEvent(event, pending, callback); toolErr != nil {
 				return emitted, toolErr
 			}
@@ -677,8 +712,14 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			// stopReason rides inside metadataEvent on the wire; there is no
 			// standalone stop reason event type. Its absence after content is
 			// how callers detect a truncated stream.
-			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
-				callback.OnStopReason(reason)
+			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" {
+				canonical, stopErr := canonicalStopReason(reason)
+				if stopErr != nil {
+					return emitted, stopErr
+				}
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(canonical)
+				}
 			}
 		}
 	}

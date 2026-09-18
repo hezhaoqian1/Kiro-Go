@@ -104,6 +104,7 @@ func integrityTestPayload() *KiroPayload {
 // CallKiroAPIContext retries it internally, so it never surfaces as a
 // transport-successful call.
 func TestRunKiroWithIntegrityRetryRecoversTruncatedThenComplete(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := hits.Add(1)
@@ -162,6 +163,7 @@ func TestRunKiroWithIntegrityRetryRecoversTruncatedThenComplete(t *testing.T) {
 // retried (would duplicate output). Helper returns the integrity error so the
 // caller can emit an error event instead of forging a normal completion.
 func TestRunKiroWithIntegrityRetrySkipsRetryAfterClientFlush(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -242,6 +244,7 @@ func TestRunKiroWithIntegrityRetryStopsOnCanceledContext(t *testing.T) {
 // returns nil for it), so the only multiplier is account rotation; see
 // maxSameAccountStreamRetries for the cost arithmetic.
 func TestRunKiroWithIntegrityRetryStopsAfterBudgetExhausted(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)

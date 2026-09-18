@@ -286,11 +286,11 @@ func TestResolveClaudeThinkingModeHonorsRequestThinking(t *testing.T) {
 			wantThinking: false,
 		},
 		{
-			name:         "suffix remains supported when thinking is disabled",
+			name:         "explicit disabled overrides suffix",
 			model:        "claude-sonnet-4.5-thinking",
 			thinking:     &ClaudeThinkingConfig{Type: "disabled"},
 			wantModel:    "claude-sonnet-4.5",
-			wantThinking: true,
+			wantThinking: false,
 		},
 	}
 
@@ -314,10 +314,10 @@ func TestClaudeThinkingBudgetMatchesRequest(t *testing.T) {
 		thinking  *ClaudeThinkingConfig
 		want      string
 	}{
-		{name: "default", want: "<max_thinking_length>8192</max_thinking_length>"},
-		{name: "short probe", maxTokens: 1024, want: "<max_thinking_length>512</max_thinking_length>"},
+		{name: "default", want: "<thinking_mode>adaptive</thinking_mode>"},
+		{name: "short probe", maxTokens: 1024, want: "<thinking_effort>medium</thinking_effort>"},
 		{name: "explicit budget", maxTokens: 4096, thinking: &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048}, want: "<max_thinking_length>2048</max_thinking_length>"},
-		{name: "adaptive", maxTokens: 4096, thinking: &ClaudeThinkingConfig{Type: "adaptive"}, want: "<max_thinking_length>2048</max_thinking_length>"},
+		{name: "adaptive", maxTokens: 4096, thinking: &ClaudeThinkingConfig{Type: "adaptive"}, want: "<thinking_effort>medium</thinking_effort>"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			request := &ClaudeRequest{Model: "claude-sonnet-5", MaxTokens: scenario.maxTokens, Thinking: scenario.thinking, Messages: []ClaudeMessage{{Role: "user", Content: "hi"}}}

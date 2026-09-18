@@ -115,13 +115,23 @@ API Key accounts call the Kiro CLI runtime (`https://runtime.{region}.kiro.dev/`
 
 Append a suffix (default `-thinking`) to the model name, e.g. `claude-sonnet-4.5-thinking`. Claude-compatible requests that include a top-level `thinking` config such as `{"type":"enabled","budget_tokens":2048}` or `{"type":"adaptive"}` also enable thinking mode automatically. Configure output format in the admin panel under Settings - Thinking Mode.
 
-Claude requests honor an explicit `thinking.budget_tokens` when constructing the upstream thinking prompt. Without one, the default is 8192, capped at half of `max_tokens` when provided to leave room for the answer. Token counting uses the same prompt. These are upstream prompt hints, not a guarantee of latency or of exposed reasoning content.
+All three protocols share the capability table in `proxy/thinking_policy.go`. Older models use enabled/budget prompts; Sonnet/Opus 4.6 and later entries in that table default to adaptive/medium effort. Claude `output_config.effort`, Chat Completions `reasoning_effort`, and Responses `reasoning.effort` map to the same policy. Only allowlisted models receive `additionalModelRequestFields.output_config.effort`. Unsupported model/mode/effort combinations return 400; unknown models are not automatically advertised with thinking variants.
 
-## Claude Streaming Compatibility
+Explicit `thinking.type=disabled` overrides the suffix. Enabled mode honors an explicit budget; otherwise it uses 8192, capped at half of `max_tokens` when provided. Adaptive mode uses effort instead of a fixed 200000 budget. Token counting uses the same prompt. This is a Kiro compatibility policy, not proof of native thinking support for every account or a guarantee of latency or exposed reasoning.
 
-When `/v1/messages` reaches a clean upstream EOF without `stopReason`, bounded integrity retries run only while no answer or thinking SSE has been sent. If retries are exhausted or output has already started, a response with non-empty answer text is completed with `end_turn` if no tag-delimited thinking block remains open. An already-started response is never retried, avoiding duplicate visible output. This accommodates replies from some Kiro profiles, including connectivity probes.
+## Shared Streaming and Completion Policy
 
-This is a compatibility heuristic, not proof that an answer is semantically complete. Reasoning-only or whitespace responses without a terminal signal, transport failures, and corrupt event frames still fail, including after output has started. A successful short probe does not guarantee long-answer compatibility. OpenAI and non-streaming EOF behavior are unchanged by this fix.
+Messages, Chat Completions, and Responses share upstream deadlines, thinking normalization, and integrity checks for both streaming and buffered requests. With the default `compatible` EOF policy, clean EOF with non-whitespace answer text and no open thinking block is retained without regeneration, but conservatively marked Claude `max_tokens`, Chat `length`, or Responses `incomplete`. This means completion could not be verified, not that a token limit was actually reached. It no longer fabricates `end_turn`. Set `KIRO_STREAM_EOF_POLICY=strict` to reject missing completion signals; bounded retries are allowed only before visible output.
+
+Reasoning-only/whitespace responses without completion, corrupt frames, transport failures, unknown stop reasons, and unclosed thinking blocks still fail. Explicit token/context limits may terminate unfinished reasoning as incomplete. Visible text, reasoning, or tool calls are never replayed. Responses uses `response.incomplete` / `response.failed` rather than false `response.completed` events, and exposes reasoning as compatibility summary_text items with stable IDs shared between stream events and the final object.
+
+Only leading `<thinking>`, `<think>`, `<reasoning>`, and `<thought>` blocks are decoded, including fragmented tags. Native and tagged reasoning are deduplicated. Tags after ordinary answer text, quoted tags, and fenced code remain literal. Only valid leading thinking-control preludes are removed; there is no global XML stripping.
+
+Streaming starts with a Claude ping or OpenAI SSE comment, committing HTTP 200 before generation. Subsequent failures use protocol error events: clients must inspect the terminal event, not just HTTP status. Heartbeats and output writes are serialized, disconnect/write failure cancels generation, and no heartbeat follows a terminal event. Native web_search paths also propagate cancellation and use heartbeats/integrity checks, while retaining their existing synthesized search-result format.
+
+The first-event deadline includes generation HTTP response headers; metadata does not count as generation progress. Text/reasoning/tool activity switches to the idle read budget. Activity, heartbeats, and retries do not extend the overall deadline. OAuth refresh/profile discovery still use their existing independent HTTP timeouts and are not immediately interruptible under the generation first-event deadline.
+
+Design references: `vagmr/kiro2api-rs` (MIT, heartbeat/tag boundaries), `mydisha/keirouter` (MIT), `jwadow/kiro-gateway` (AGPL-3, timeout/completion policy), and `justlovemaki/AIClient2API` (GPL-3, effort adaptation). This is an independent Go implementation reusing this repository's parser/retry infrastructure; no source was copied from those projects, preserving this repository's MIT licensing boundary.
 
 ## Outbound Proxy
 
@@ -135,6 +145,15 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Config file path | `data/config.json` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
+| `KIRO_FIRST_EVENT_TIMEOUT` | First generation event budget | `60s` |
+| `KIRO_THINKING_FIRST_EVENT_TIMEOUT` | First event budget with thinking enabled | `180s` |
+| `KIRO_STREAM_IDLE_TIMEOUT` | Upstream read inactivity after first event | `90s` |
+| `KIRO_STREAM_TOTAL_TIMEOUT` | Overall generation request budget, including retries | `5m` |
+| `KIRO_SSE_PING_INTERVAL` | Downstream heartbeat interval | `15s` |
+| `KIRO_SSE_WRITE_TIMEOUT` | Downstream write/flush deadline | `15s` |
+| `KIRO_STREAM_EOF_POLICY` | `compatible` or `strict` | `compatible` |
+
+Durations accept Go syntax (`90s`, `5m`) or integer seconds, must be positive, and cannot exceed 24 hours. Invalid values warn and fall back to defaults. Set these in the Railway service environment. Timeout errors identify `first_event`, `idle`, or `total` for diagnostics.
 
 ## Contributing
 

@@ -105,32 +105,6 @@ type microsoftProfileDiscovery struct {
 	cancel context.CancelFunc
 }
 
-type thinkingStreamSource int
-
-const (
-	thinkingSourceUnknown thinkingStreamSource = iota
-	thinkingSourceReasoningEvent
-	thinkingSourceTagBlock
-)
-
-func allowReasoningSource(source *thinkingStreamSource) bool {
-	if *source == thinkingSourceTagBlock {
-		return false
-	}
-	*source = thinkingSourceReasoningEvent
-	return true
-}
-
-func allowTagSource(source *thinkingStreamSource) bool {
-	if *source == thinkingSourceReasoningEvent {
-		return false
-	}
-	if *source == thinkingSourceUnknown {
-		*source = thinkingSourceTagBlock
-	}
-	return *source == thinkingSourceTagBlock
-}
-
 func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if len(req.Messages) == 0 {
 		return "messages must not be empty"
@@ -547,8 +521,12 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		for _, m := range cached {
 			supportsImage := modelSupportsImage(m.InputTypes)
 			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+			capability := modelThinkingCapability(m.ModelId)
+			if capability.Mode != "unverified" {
+				variant := buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage)
+				variant["thinking_capability"] = capability
+				models = append(models, variant)
+			}
 		}
 	}
 	return models
@@ -825,6 +803,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	if message := validateThinkingModel(actualModel, thinking, req.Thinking, claudeEffort(&req)); message != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", message)
+		return
+	}
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
@@ -843,6 +825,9 @@ func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := streamLifetime(r.Context())
+	defer cancel()
+	r = r.WithContext(ctx)
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
@@ -871,14 +856,31 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
+	if message := validateThinkingModel(actualModel, thinking, req.Thinking, claudeEffort(&req)); message != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", message)
+		return
+	}
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
+	if req.Stream && hasWebSearchAmongTools(&req) {
+		if _, ok := w.(http.Flusher); !ok {
+			h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		streamCtx, transport := startSSE(r.Context(), w, "claude")
+		defer transport.Close()
+		w = transport
+		r = r.WithContext(streamCtx)
+	}
+
 	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
 	if hasWebSearchTool(&req) {
-		h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
+		h.handleWebSearchRequest(r.Context(), w, &req, estimatedInputTokens, apiKeyID)
 		return
 	}
 
@@ -914,6 +916,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	// 获取 thinking 输出格式配置
+	ctx, transport := startSSE(ctx, w, "claude")
+	defer transport.Close()
+	w, flusher = transport, transport
 	thinkingFormat := thinkingOpts.Format
 
 	reqStart := time.Now()
@@ -1016,9 +1021,6 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
-		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 
@@ -1105,12 +1107,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		processClaudeText := func(text string, isThinking bool, forceFlush bool) {
-			if isThinking && !thinking {
-				return
-			}
-
 			if isThinking {
-				if !allowReasoningSource(&thinkingSource) {
+				if !thinking {
 					return
 				}
 				if !thinkingStarted {
@@ -1122,91 +1120,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				}
 				return
 			}
-
 			if eventThinkingOpen {
 				sendText("", 3)
 				eventThinkingOpen = false
 				thinkingStarted = false
 			}
-
 			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendText(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendText(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendText(content, 1)
-								sendText("", 3)
-							} else {
-								sendText(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendText(textBuffer, 1)
-									sendText("", 3)
-								} else {
-									sendText(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendText(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendText(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
-				}
+			if forceFlush || len([]rune(textBuffer)) > 50 {
+				sendText(textBuffer, 0)
+				textBuffer = ""
 			}
 		}
 
@@ -1281,12 +1203,6 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			return rawContentBuilder.Len(), len(toolUses), upstreamStopReason, rawThinkingBuilder.Len() > 0
 		}
 
-		// A same-account retry only happens while nothing has been flushed, so
-		// SSE block indices are still at their initial values and need no
-		// rollback. What must be cleared is every accumulator plus the thinking
-		// tag parser state: processClaudeText buffers up to 50 runes before
-		// flushing, so a short truncated attempt can leave a partial tag behind
-		// that would otherwise be prefixed onto the retry's first chunk.
 		reset := func() {
 			rawContentBuilder.Reset()
 			rawThinkingBuilder.Reset()
@@ -1297,9 +1213,6 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			realInputTokens = 0
 			upstreamStopReason = ""
 			textBuffer = ""
-			inThinkingBlock = false
-			dropTagThinking = false
-			thinkingSource = thinkingSourceUnknown
 			thinkingStarted = false
 			eventThinkingOpen = false
 		}
@@ -1308,17 +1221,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			func() bool { return !messageStarted })
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
-
-			bufferedText, _ := extractThinkingFromContent(rawContentBuilder.String())
-			if isStreamIntegrityError(err) && !inThinkingBlock &&
-				strings.TrimSpace(bufferedText) != "" {
-				upstreamStopReason = "end_turn"
-				err = nil
-			}
-		}
-		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			if !isStreamIntegrityError(err) {
@@ -1346,11 +1251,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent := strings.TrimSpace(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
-		if thinking && thinkingOutput == "" && extractedReasoning != "" {
-			thinkingOutput = extractedReasoning
-		}
 		if !thinking {
 			thinkingOutput = ""
 		}
@@ -1614,32 +1516,20 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
-			// Some Kiro profiles close a complete non-stream response without
-			// emitting a stop reason. The buffered body is still usable; only
-			// reject integrity failures when nothing was returned at all.
-			if isStreamIntegrityError(err) && (content != "" || len(toolUses) > 0 || thinkingContent != "") {
-				err = nil
+			lastErr = err
+			excluded[account.ID] = true
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(account, err)
 			}
-			if err == nil {
-				// Continue with the buffered response below.
-			} else {
-				lastErr = err
-				excluded[account.ID] = true
-				if !isStreamIntegrityError(err) {
-					h.handleAccountFailure(account, err)
-				}
-				continue
-			}
+			continue
 		}
 
 		thinkingFormat := thinkingOpts.Format
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
+		finalContent := strings.TrimSpace(content)
 		rawThinkingContent := thinkingContent
-		if thinking && rawThinkingContent == "" && extractedReasoning != "" {
-			rawThinkingContent = extractedReasoning
-		}
 		if !thinking {
 			rawThinkingContent = ""
 		}
@@ -1700,6 +1590,10 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
+	if transport, ok := w.(*sseTransport); ok {
+		transport.Error(errType, message)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1713,6 +1607,9 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 
 // handleOpenAIChat OpenAI API 处理
 func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := streamLifetime(r.Context())
+	defer cancel()
+	r = r.WithContext(ctx)
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
@@ -1737,6 +1634,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.ReasoningEffort = strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
+	thinking = thinking || req.ReasoningEffort != ""
+	if message := validateThinkingModel(actualModel, thinking, nil, req.ReasoningEffort); message != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", message)
+		return
+	}
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
@@ -1763,6 +1666,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	// 获取 thinking 输出格式配置
+	ctx, transport := startSSE(ctx, w, "openai")
+	defer transport.Close()
+	w, flusher = transport, transport
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
@@ -1791,9 +1697,6 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
-		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
 		responseStarted := false
@@ -1908,12 +1811,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		processText := func(text string, isThinking bool, forceFlush bool) {
-			if isThinking && !thinking {
-				return
-			}
-
 			if isThinking {
-				if !allowReasoningSource(&thinkingSource) {
+				if !thinking {
 					return
 				}
 				if !thinkingStarted {
@@ -1925,91 +1824,15 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				}
 				return
 			}
-
 			if eventThinkingOpen {
 				sendChunk("", 3)
 				eventThinkingOpen = false
 				thinkingStarted = false
 			}
-
 			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendChunk(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendChunk(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendChunk(content, 1)
-								sendChunk("", 3)
-							} else {
-								sendChunk(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendChunk(textBuffer, 1)
-									sendChunk("", 3)
-								} else {
-									sendChunk(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendChunk(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendChunk(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
-				}
+			if forceFlush || len([]rune(textBuffer)) > 50 {
+				sendChunk(textBuffer, 0)
+				textBuffer = ""
 			}
 		}
 
@@ -2097,9 +1920,6 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			realInputTokens = 0
 			upstreamStopReason = ""
 			textBuffer = ""
-			inThinkingBlock = false
-			dropTagThinking = false
-			thinkingSource = thinkingSourceUnknown
 			thinkingStarted = false
 			eventThinkingOpen = false
 		}
@@ -2108,6 +1928,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			func() bool { return !responseStarted })
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
 			lastErr = err
@@ -2134,11 +1955,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
 		}
-		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
+		outputContent := strings.TrimSpace(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
-		if thinking && reasoningOutput == "" && extractedReasoning != "" {
-			reasoningOutput = extractedReasoning
-		}
 		if !thinking {
 			reasoningOutput = ""
 		}
@@ -2251,28 +2069,19 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
-			if isStreamIntegrityError(err) && (content != "" || len(toolUses) > 0 || reasoningContent != "") {
-				err = nil
+			lastErr = err
+			excluded[account.ID] = true
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(account, err)
 			}
-			if err == nil {
-				// Continue with the buffered response below.
-			} else {
-				lastErr = err
-				excluded[account.ID] = true
-				// Integrity failures are upstream hiccups, not account faults.
-				if !isStreamIntegrityError(err) {
-					h.handleAccountFailure(account, err)
-				}
-				continue
-			}
+			continue
 		}
 
-		finalContent, extractedReasoning := extractThinkingFromContent(content)
-		if thinking && reasoningContent == "" && extractedReasoning != "" {
-			reasoningContent = extractedReasoning
-		} else if !thinking {
+		finalContent := strings.TrimSpace(content)
+		if !thinking {
 			reasoningContent = ""
 		}
 
@@ -2305,6 +2114,10 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
+	if transport, ok := w.(*sseTransport); ok {
+		transport.Error(errType, message)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{

@@ -4,27 +4,9 @@ import (
 	"context"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"strings"
 )
 
-// runKiroWithIntegrityRetry calls Kiro and recovers a truncated upstream stream
-// the way Kiro IDE does: retry the same request on the same account within a
-// bounded budget before surfacing the failure.
-//
-// callback is reused across attempts. Both CallKiroAPIContext and
-// parseEventStreamTracked copy the struct before wrapping any field, so a retry
-// cannot double-wrap it; per-attempt state is cleared by reset instead.
-// measure reports the integrity inputs after a transport-successful call.
-// reset clears per-attempt state before a same-account retry; may be nil.
-// canRetry reports whether a retry is still safe (for streaming: nothing has
-// been flushed to the client yet). nil means always retryable.
-//
-// Return contract:
-//   - nil: complete success only
-//   - transport error from CallKiroAPIContext: caller should rotate/ban as usual
-//   - integrity error while still retryable: retries exhausted; caller should
-//     rotate account without treating it as an auth/quota failure
-//   - integrity error after client flush: caller must surface failure to the
-//     client (do not fake end_turn / normal completion). Retry is unsafe.
 func runKiroWithIntegrityRetry(
 	ctx context.Context,
 	account *config.Account,
@@ -47,12 +29,32 @@ func runKiroWithIntegrityRetry(
 			reset()
 		}
 
-		err := CallKiroAPIContext(ctx, account, payload, callback)
+		tracked := KiroStreamCallback{}
+		if callback != nil {
+			tracked = *callback
+		}
+		answerSeen := false
+		tracked.OnText = func(text string, thinking bool) {
+			if !thinking && strings.TrimSpace(text) != "" {
+				answerSeen = true
+			}
+			if callback != nil && callback.OnText != nil {
+				callback.OnText(text, thinking)
+			}
+		}
+		err := CallKiroAPIContext(ctx, account, payload, &tracked)
 		if err != nil {
 			return err
 		}
 
 		contentChars, toolCount, stopReason, sawReasoning := measure()
+		if strings.TrimSpace(stopReason) == "" && toolCount == 0 && answerSeen && !getStreamOptions().StrictEOF {
+			logger.Warnf("[StreamCompletion] completion=missing_stop_reason policy=compatible action=max_tokens account=%s", label)
+			if callback != nil && callback.OnStopReason != nil {
+				callback.OnStopReason("max_tokens")
+			}
+			return nil
+		}
 		integrityErr := classifyStreamIntegrity(contentChars, toolCount, stopReason, sawReasoning)
 		if integrityErr == nil {
 			return nil

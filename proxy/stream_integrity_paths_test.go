@@ -78,8 +78,8 @@ func TestClaudeStreamCompletesTextAfterMissingStopReason(t *testing.T) {
 	if !strings.Contains(body, "partial answer") {
 		t.Fatalf("expected flushed content, got %s", body)
 	}
-	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Fatalf("expected implicit end_turn, got %s", body)
+	if !strings.Contains(body, `"stop_reason":"max_tokens"`) {
+		t.Fatalf("expected conservative incomplete marker, got %s", body)
 	}
 	if strings.Contains(body, `"type":"error"`) || !strings.Contains(body, "event: message_stop\n") {
 		t.Fatalf("expected successful terminal event, got %s", body)
@@ -115,14 +115,14 @@ func TestClaudeStreamAcceptsBufferedResponseWithoutStopReason(t *testing.T) {
 	if !strings.Contains(body, "short answer") {
 		t.Fatalf("expected buffered content, got %s", body)
 	}
-	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Fatalf("expected implicit end_turn, got %s", body)
+	if !strings.Contains(body, `"stop_reason":"max_tokens"`) {
+		t.Fatalf("expected conservative incomplete marker, got %s", body)
 	}
 	if strings.Contains(body, `"type":"error"`) {
 		t.Fatalf("buffered response must not fail, got %s", body)
 	}
-	if hits.Load() != 1+maxSameAccountStreamRetries {
-		t.Fatalf("expected bounded integrity retries before accepting response, hits=%d", hits.Load())
+	if hits.Load() != 1 {
+		t.Fatalf("compatibility mode must not regenerate usable text, hits=%d", hits.Load())
 	}
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Header().Get("Content-Type"), "text/event-stream") {
 		t.Fatalf("expected SSE success, got %d headers=%v", rec.Code, rec.Header())
@@ -177,8 +177,8 @@ func TestClaudeStreamThinkingAndToolCompletionWithoutStopReason(t *testing.T) {
 		answer     string
 		stopReason string
 	}{
-		{name: "native reasoning then answer", eventType: "reasoningContentEvent", payload: map[string]interface{}{"text": "reasoning"}, answer: "finished answer", stopReason: "end_turn"},
-		{name: "tag reasoning then answer", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>" + strings.Repeat("reasoning ", 12) + "</thinking>"}, answer: "finished answer", stopReason: "end_turn"},
+		{name: "native reasoning then answer", eventType: "reasoningContentEvent", payload: map[string]interface{}{"text": "reasoning"}, answer: "finished answer", stopReason: "max_tokens"},
+		{name: "tag reasoning then answer", eventType: "assistantResponseEvent", payload: map[string]interface{}{"content": "<thinking>" + strings.Repeat("reasoning ", 12) + "</thinking>"}, answer: "finished answer", stopReason: "max_tokens"},
 		{name: "tool use", eventType: "toolUseEvent", payload: map[string]interface{}{"toolUseId": "toolu_1", "name": "lookup", "input": `{"query":"test"}`, "stop": true}, stopReason: "tool_use"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
@@ -210,6 +210,7 @@ func TestClaudeStreamThinkingAndToolCompletionWithoutStopReason(t *testing.T) {
 }
 
 func TestClaudeNonStreamRetriesTruncatedStream(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := hits.Add(1)
@@ -298,6 +299,7 @@ func TestIntegrityFailureDoesNotBanAccount(t *testing.T) {
 // Responses streaming must surface response.failed instead of closing the turn
 // with response.completed when the upstream truncated.
 func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	server := truncatedUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
@@ -322,6 +324,7 @@ func TestResponsesStreamEmitsFailedOnTruncatedStream(t *testing.T) {
 
 // OpenAI streaming must not close a truncated turn with a normal finish_reason.
 func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	server := truncatedUpstream(t, nil)
 	defer server.Close()
 	h := setupIntegrityPathTest(t, server)
@@ -353,6 +356,7 @@ func TestOpenAIStreamEmitsErrorOnTruncatedStream(t *testing.T) {
 // unflushed chunk stays inside processClaudeText's tag buffer, so a retry that
 // does not clear it concatenates the previous attempt's text onto the new one.
 func TestClaudeStreamRetryDoesNotLeakPreviousAttemptText(t *testing.T) {
+	t.Setenv("KIRO_STREAM_EOF_POLICY", "strict")
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := hits.Add(1)

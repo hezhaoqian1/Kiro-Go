@@ -14,6 +14,9 @@ import (
 const defaultResponsesModel = "claude-sonnet-4.5"
 
 func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := streamLifetime(r.Context())
+	defer cancel()
+	r = r.WithContext(ctx)
 	if r.Method != "POST" {
 		http.Error(w, "Method Not Allowed", 405)
 		return
@@ -106,6 +109,14 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	if req.Reasoning != nil {
+		openaiReq.ReasoningEffort = strings.ToLower(strings.TrimSpace(req.Reasoning.Effort))
+		thinking = thinking || openaiReq.ReasoningEffort != ""
+	}
+	if message := validateThinkingModel(actualModel, thinking, nil, openaiReq.ReasoningEffort); message != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", message)
+		return
+	}
 	openaiReq.Model = actualModel
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
@@ -191,6 +202,7 @@ func (h *Handler) handleResponsesNonStream(
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
 			lastErr = err
@@ -202,7 +214,7 @@ func (h *Handler) handleResponsesNonStream(
 			continue
 		}
 
-		finalContent, _ := extractThinkingFromContent(content)
+		finalContent := strings.TrimSpace(content)
 		if !thinking {
 			reasoningContent = ""
 		}
@@ -220,6 +232,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
+		addResponsesReasoning(respObj, reasoningContent)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -332,6 +345,9 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 
+	ctx, transport := startSSE(ctx, w, "responses")
+	defer transport.Close()
+	w, flusher = transport, transport
 	send := func(eventName string, payload interface{}) {
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -391,39 +407,7 @@ func (h *Handler) handleResponsesStream(
 			upstreamStopReason string
 		)
 
-		messageItemID := generateOutputItemID("msg")
-		messageStarted := false
-		outputIndex := 0
-		contentIndex := 0
-
-		ensureMessageStarted := func() {
-			if messageStarted {
-				return
-			}
-			messageStarted = true
-			send("response.output_item.added", map[string]interface{}{
-				"type":         "response.output_item.added",
-				"output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id":      messageItemID,
-					"type":    "message",
-					"role":    "assistant",
-					"status":  "in_progress",
-					"content": []map[string]interface{}{},
-				},
-			})
-			send("response.content_part.added", map[string]interface{}{
-				"type":          "response.content_part.added",
-				"item_id":       messageItemID,
-				"output_index":  outputIndex,
-				"content_index": contentIndex,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
-				},
-			})
-		}
-
+		output := newResponsesStreamOutput(send)
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -431,83 +415,18 @@ func (h *Handler) handleResponsesStream(
 				}
 				if isThinking {
 					reasoningText.WriteString(text)
-					return
+					if !thinking {
+						return
+					}
+				} else {
+					fullText.WriteString(text)
 				}
-				fullText.WriteString(text)
-				ensureMessageStarted()
-				send("response.output_text.delta", map[string]interface{}{
-					"type":          "response.output_text.delta",
-					"item_id":       messageItemID,
-					"output_index":  outputIndex,
-					"content_index": contentIndex,
-					"delta":         text,
-				})
+				output.text(text, isThinking)
 				responseStarted = true
 			},
-			OnToolUse: func(tu KiroToolUse) {
-				if messageStarted {
-					send("response.content_part.done", map[string]interface{}{
-						"type":          "response.content_part.done",
-						"item_id":       messageItemID,
-						"output_index":  outputIndex,
-						"content_index": contentIndex,
-						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": fullText.String(),
-						},
-					})
-					send("response.output_item.done", map[string]interface{}{
-						"type":         "response.output_item.done",
-						"output_index": outputIndex,
-						"item": map[string]interface{}{
-							"id":     messageItemID,
-							"type":   "message",
-							"role":   "assistant",
-							"status": "completed",
-							"content": []map[string]interface{}{{
-								"type": "output_text",
-								"text": fullText.String(),
-							}},
-						},
-					})
-					messageStarted = false
-					outputIndex++
-				}
-
-				toolUses = append(toolUses, tu)
-				args, _ := json.Marshal(tu.Input)
-				fcID := generateOutputItemID("fc")
-				send("response.output_item.added", map[string]interface{}{
-					"type":         "response.output_item.added",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "in_progress",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": "",
-					},
-				})
-				send("response.function_call_arguments.delta", map[string]interface{}{
-					"type":         "response.function_call_arguments.delta",
-					"item_id":      fcID,
-					"output_index": outputIndex,
-					"delta":        string(args),
-				})
-				send("response.output_item.done", map[string]interface{}{
-					"type":         "response.output_item.done",
-					"output_index": outputIndex,
-					"item": map[string]interface{}{
-						"id":        fcID,
-						"type":      "function_call",
-						"status":    "completed",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
-						"arguments": string(args),
-					},
-				})
-				outputIndex++
+			OnToolUse: func(tool KiroToolUse) {
+				toolUses = append(toolUses, tool)
+				output.tool(tool)
 				responseStarted = true
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
@@ -524,13 +443,10 @@ func (h *Handler) handleResponsesStream(
 			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
 		}
 
-		// Retries only run while responseStarted is false, i.e. before any
-		// content or function-call item has been sent, so the output_index /
-		// content_index cursors are still untouched. Only the accumulators need
-		// clearing.
 		reset := func() {
 			fullText.Reset()
 			reasoningText.Reset()
+			output = newResponsesStreamOutput(send)
 			toolUses = nil
 			inputTokens = 0
 			outputTokens = 0
@@ -543,6 +459,7 @@ func (h *Handler) handleResponsesStream(
 			func() bool { return !responseStarted })
 		if err != nil {
 			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
 				return
 			}
 			if !responseStarted {
@@ -569,38 +486,14 @@ func (h *Handler) handleResponsesStream(
 			return
 		}
 
-		finalContent, _ := extractThinkingFromContent(fullText.String())
+		finalContent := strings.TrimSpace(fullText.String())
 		reasoning := reasoningText.String()
 		if !thinking {
 			reasoning = ""
 		}
 
-		if messageStarted {
-			send("response.content_part.done", map[string]interface{}{
-				"type":          "response.content_part.done",
-				"item_id":       messageItemID,
-				"output_index":  outputIndex,
-				"content_index": contentIndex,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": finalContent,
-				},
-			})
-			send("response.output_item.done", map[string]interface{}{
-				"type":         "response.output_item.done",
-				"output_index": outputIndex,
-				"item": map[string]interface{}{
-					"id":     messageItemID,
-					"type":   "message",
-					"role":   "assistant",
-					"status": "completed",
-					"content": []map[string]interface{}{{
-						"type": "output_text",
-						"text": finalContent,
-					}},
-				},
-			})
-		}
+		status, _ := mapResponsesCompletion(upstreamStopReason)
+		output.finish(status)
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
@@ -616,6 +509,7 @@ func (h *Handler) handleResponsesStream(
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
+		respObj.Output = output.items
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -625,12 +519,11 @@ func (h *Handler) handleResponsesStream(
 			}
 		}
 
-		send("response.completed", map[string]interface{}{
-			"type":     "response.completed",
+		terminalEvent := "response." + respObj.Status
+		send(terminalEvent, map[string]interface{}{
+			"type":     terminalEvent,
 			"response": respObj,
 		})
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
 		return
 	}
 

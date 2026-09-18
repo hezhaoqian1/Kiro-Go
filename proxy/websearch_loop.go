@@ -52,10 +52,15 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 	// search-only round (same pattern as 0..=MAX_WEB_SEARCH_ROUNDS in kiro-rs).
 	for roundIdx := 0; roundIdx <= maxUses; roundIdx++ {
 		if ctx.Err() != nil {
+			reportStreamCancellation(w, ctx)
 			return
 		}
 		round, account, err := h.callUpstreamForWebSearch(ctx, &working, thinking, fallbackInput)
 		if err != nil {
+			if ctx.Err() != nil {
+				reportStreamCancellation(w, ctx)
+				return
+			}
 			logger.Warnf("[WebSearchLoop] upstream round %d failed: %v", roundIdx, err)
 			accountID := ""
 			if account != nil {
@@ -83,7 +88,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 		// this round's searches fit under max_uses.
 		roundSearchN := countWebSearchToolUses(round.toolUses)
 		if shouldSearchRound(roundIdx, round.toolUses, maxUses) && searchCount+roundSearchN <= maxUses {
-			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses)
+			searched, searchErr := h.searchAllWebUses(ctx, req.Model, round.toolUses)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, searchErr)
@@ -107,7 +112,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 				logger.Warnf("[WebSearchLoop] max_uses=%d reached; skipping further web_search", maxUses)
 				break
 			}
-			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input))
+			results, _, _, sErr := h.performWebSearch(ctx, req.Model, toolUseQuery(tu.Input))
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
 				h.recordFailureWithDetails("claude", req.Model, lastAccountID, sErr)
@@ -168,10 +173,13 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 		var credits float64
 		var realInputTokens int
 		var stopOverride string
+		var upstreamStopReason string
+		var sawReasoning bool
 
 		callback := &KiroStreamCallback{
 			OnText: func(t string, isThinking bool) {
 				if isThinking {
+					sawReasoning = true
 					return
 				}
 				text += t
@@ -192,6 +200,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 					stopOverride = "model_context_window_exceeded"
 				}
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 			OnError: func(err error) {
 				if err != nil {
 					lastErr = err
@@ -199,17 +208,30 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			},
 		}
 
-		err := CallKiroAPIContext(ctx, account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(text), len(toolUses), upstreamStopReason, sawReasoning
+		}
+		reset := func() {
+			text, upstreamStopReason, stopOverride = "", "", ""
+			toolUses = nil
+			inputTokens, realInputTokens, credits, sawReasoning = 0, 0, 0, false
+		}
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, account, ctx.Err()
 			}
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			if !isStreamIntegrityError(err) {
+				h.handleAccountFailure(account, err)
+			}
 			continue
 		}
 
+		if upstreamStopReason != "" && upstreamStopReason != "tool_use" {
+			stopOverride = upstreamStopReason
+		}
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
@@ -259,10 +281,10 @@ func countWebSearchToolUses(toolUses []KiroToolUse) int {
 }
 
 // searchAllWebUses runs MCP for each tool_use in order (all are web_search).
-func (h *Handler) searchAllWebUses(model string, toolUses []KiroToolUse) ([]*WebSearchResults, error) {
+func (h *Handler) searchAllWebUses(ctx context.Context, model string, toolUses []KiroToolUse) ([]*WebSearchResults, error) {
 	out := make([]*WebSearchResults, 0, len(toolUses))
 	for _, tu := range toolUses {
-		results, _, _, err := h.performWebSearch(model, toolUseQuery(tu.Input))
+		results, _, _, err := h.performWebSearch(ctx, model, toolUseQuery(tu.Input))
 		if err != nil {
 			return nil, err
 		}
@@ -472,9 +494,11 @@ func (h *Handler) renderWebSearchLoopSSE(
 	stopReason string,
 	inputTokens, outputTokens int,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	if _, streaming := w.(*sseTransport); !streaming {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -245,7 +246,7 @@ func randomFromCharset(n int, charset string) string {
 }
 
 // callMcpAPI posts the JSON-RPC request to Kiro MCP and returns the parsed response.
-func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, error) {
+func callMcpAPI(ctx context.Context, account *config.Account, mcpReq *McpRequest) (*McpResponse, error) {
 	if mcpReq == nil {
 		return nil, fmt.Errorf("nil MCP request")
 	}
@@ -272,7 +273,7 @@ func callMcpAPI(account *config.Account, mcpReq *McpRequest) (*McpResponse, erro
 	}
 	logger.Debugf("[MCP] Request: %s", string(reqBody))
 
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +362,7 @@ func parseSearchResults(mcpResp *McpResponse) *WebSearchResults {
 // A 200 JSON-RPC envelope whose search payload cannot be parsed is also treated
 // as failure (retry next account) — only a well-formed results object (including
 // an empty results array) counts as success.
-func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, string, *config.Account, error) {
+func (h *Handler) performWebSearch(ctx context.Context, model, query string) (*WebSearchResults, string, *config.Account, error) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -377,8 +378,11 @@ func (h *Handler) performWebSearch(model, query string) (*WebSearchResults, stri
 		}
 
 		toolUseID, mcpReq := createMcpRequest(query)
-		mcpResp, err := callMcpAPI(account, mcpReq)
+		mcpResp, err := callMcpAPI(ctx, account, mcpReq)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, "", account, context.Cause(ctx)
+			}
 			logger.Warnf("[WebSearch] MCP call failed on account %s: %v", account.Email, err)
 			lastErr = err
 			excluded[account.ID] = true
@@ -502,7 +506,7 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 // ==================== Pure-path handler ====================
 
 // handleWebSearchRequest serves pure native web_search requests via MCP.
-func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleWebSearchRequest(ctx context.Context, w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
 	query := extractSearchQuery(req)
 	if query == "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Unable to extract search query from message")
@@ -512,8 +516,12 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 	logger.Infof("[WebSearch] Processing query: %s (stream=%v)", query, req.Stream)
 	reqStart := time.Now()
 
-	results, toolUseID, account, err := h.performWebSearch(req.Model, query)
+	results, toolUseID, account, err := h.performWebSearch(ctx, req.Model, query)
 	if err != nil {
+		if ctx.Err() != nil {
+			reportStreamCancellation(w, ctx)
+			return
+		}
 		logger.Warnf("[WebSearch] All MCP attempts failed: %v", err)
 		accountID := ""
 		if account != nil {
@@ -592,9 +600,11 @@ func (h *Handler) streamWebSearchSSE(
 	results *WebSearchResults,
 	inputTokens, outputTokens int,
 ) {
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	if _, streaming := w.(*sseTransport); !streaming {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

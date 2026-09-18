@@ -13,7 +13,22 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: golang:1.23
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit and protocol regression tests
+        run: go test ./... -count=1 -timeout=120s
+      - name: Stream concurrency regression tests
+        run: go test -race ./proxy -count=1 -timeout=180s
+      - name: Static analysis
+        run: go vet ./...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

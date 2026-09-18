@@ -38,21 +38,8 @@ var modelAliases = []modelMapping{
 // (claude-sonnet-4-20250514) are not accidentally rewritten.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
 
-// Thinking 模式提示
-const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>200000</max_thinking_length>`
-
 func claudeThinkingPrompt(req *ClaudeRequest) string {
-	budget := 8192
-	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-		budget = req.Thinking.BudgetTokens
-	} else if req.MaxTokens > 0 {
-		budget = min(budget, max(1, req.MaxTokens/2))
-	}
-	if req.MaxTokens > 0 && budget >= req.MaxTokens {
-		budget = max(1, req.MaxTokens-1)
-	}
-	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", budget)
+	return buildThinkingPrompt(req.Model, req.Thinking, req.MaxTokens, claudeEffort(req))
 }
 
 const minimalFallbackUserContent = "."
@@ -114,6 +101,9 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 
 func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
 	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
+	if thinkingCfg != nil && strings.EqualFold(strings.TrimSpace(thinkingCfg.Type), "disabled") {
+		return actualModel, false
+	}
 	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
 }
 
@@ -133,16 +123,17 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
+	Model        string                `json:"model"`
+	Messages     []ClaudeMessage       `json:"messages"`
+	MaxTokens    int                   `json:"max_tokens"`
+	Temperature  float64               `json:"temperature,omitempty"`
+	TopP         float64               `json:"top_p,omitempty"`
+	Stream       bool                  `json:"stream,omitempty"`
+	System       interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Tools        []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice   interface{}           `json:"tool_choice,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
@@ -319,6 +310,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 构建 payload
 	payload := &KiroPayload{}
+	applyThinkingPolicy(payload, modelID, thinking, claudeEffort(req))
 	payload.ToolNameMap = toolNameMap
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
@@ -1087,13 +1079,14 @@ func mapOpenAIFinishReason(reason string, toolCount int) string {
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []OpenAIMessage `json:"messages"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Temperature     float64         `json:"temperature,omitempty"`
+	TopP            float64         `json:"top_p,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	Tools           []OpenAITool    `json:"tools,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1212,7 +1205,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 
 	// 如果启用 thinking 模式，注入 thinking 提示
 	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+		systemPrompt = buildThinkingPrompt(modelID, nil, req.MaxTokens, req.ReasoningEffort) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息
@@ -1360,6 +1353,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
+	applyThinkingPolicy(payload, modelID, thinking, req.ReasoningEffort)
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
@@ -2178,33 +2172,6 @@ func KiroToOpenAIResponse(content string, toolUses []KiroToolUse, inputTokens, o
 			TotalTokens:      inputTokens + outputTokens,
 		},
 	}
-}
-
-// extractThinkingFromContent 从内容中提取 <thinking> 标签内的内容
-func extractThinkingFromContent(content string) (string, string) {
-	var reasoning string
-	result := content
-
-	for {
-		start := strings.Index(result, "<thinking>")
-		if start == -1 {
-			break
-		}
-		end := strings.Index(result[start:], "</thinking>")
-		if end == -1 {
-			break
-		}
-		end += start
-
-		// 提取 thinking 内容
-		thinkingContent := result[start+10 : end]
-		reasoning += thinkingContent
-
-		// 从结果中移除 thinking 标签
-		result = result[:start] + result[end+11:]
-	}
-
-	return strings.TrimSpace(result), reasoning
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
