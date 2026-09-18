@@ -155,6 +155,8 @@ Claude Messages、Chat Completions、Responses 的流式/非流式请求共用�
 
 时间支持 Go duration（如 `90s`、`5m`）或整数秒，必须大于 0 且不超过 24 小时；无效值记录警告并使用默认值。Railway 可在服务环境变量中配置。超时错误标识 `first_event`、`idle` 或 `total`，便于区分等待生成、流中断和总预算耗尽。
 
+CI 执行全量普通测试和静态检查，并对新增传输、超时、解析器、Responses 输出模块重复执行竞态检查。全量 proxy 竞态测试目前会暴露既有的跨测试 `config.Init` 与异步账号统计 `config.Save` 竞态；本次不将整个项目宣称为无竞态。
+
 ## 参与贡献
 
 欢迎友好交流。遇到问题时，建议先让 Claude Code、Codex 等工具帮忙排查一下，大部分问题都能自己解决。如果能直接提个 PR 就更好了。

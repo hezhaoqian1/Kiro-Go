@@ -155,6 +155,8 @@ The setting takes effect immediately without restarting.
 
 Durations accept Go syntax (`90s`, `5m`) or integer seconds, must be positive, and cannot exceed 24 hours. Invalid values warn and fall back to defaults. Set these in the Railway service environment. Timeout errors identify `first_event`, `idle`, or `total` for diagnostics.
 
+CI runs the full ordinary test suite and static analysis, plus repeated race-enabled tests for the new transport, deadline, parser, and Responses output components. The full proxy race suite currently exposes a pre-existing cross-test race between `config.Init` and asynchronous account-stat persistence (`config.Save`); it is not represented as race-clean by this change.
+
 ## Contributing
 
 Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
