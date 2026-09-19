@@ -37,8 +37,7 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	p := accountpool.GetPool()
 	p.Reload()
 	return &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		pool: p,
 	}
 }
 

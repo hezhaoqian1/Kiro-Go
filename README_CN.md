@@ -121,11 +121,19 @@ Thinking 设置中的「触发后缀」可以留空。留空后，直接使用�
 
 ## Prompt Cache
 
+2026-09-19 在当前部署账号上进行重复前缀诊断：IDE 路线只有正文、contextUsage 和 metering 事件；CLI runtime 路线额外返回 metadata 和真实结束原因，但两条路线均未返回 tokenUsage/cache 计数。因此这里只能确认“未报告”，不能把未报告当成 0 命中，也不能从 credits 的下降反推出缓存 token 数。
+
 Claude 工具定义中的 `cache_control` 会转换为 `userInputMessageContext.tools` 内的 `cachePoint`。这只是请求兼容映射，不代表上游已经缓存或给予缓存折扣。系统提示和消息上的 `cache_control` 接受但不转换为断点；保留正常内容。当前部署端点的对照实测中，历史数组插入独立 `cachePoint` 会导致 HTTP 400 `Improperly formed request`，移除该断点后同一请求成功，因此不再发送这种历史条目。
 
 代理不会根据本地 fingerprint、账号或 TTL 猜测缓存命中。只有 Kiro 上游实际返回缓存 usage 时，Claude 响应才会带缓存统计；5 分钟/1 小时明细仅有上游报告才有意义，TTL 选择不保证支持。当前部署的工具前缀重复请求（流式与非流式）均未观察到缓存统计，因此不能宣称已实现 Anthropic 官方 Prompt Caching 或缓存折扣。`stream=true` 与缓存是否生效独立，关闭流式不会开启缓存。BirdSub2Api 账单金额是网关定价结果，不是 Kiro 实际 credits 的缓存证明。
 
 ## 共享流式链路与完整性
+
+管理面板「端点设置」新增 `Kiro CLI (runtime)`，对应 `preferredEndpoint=cli`，OAuth 和 API Key 均可使用；OAuth 使用 profile 的数据区域，API Key 使用配置区域。CLI 使用自身的 JSON 协议、origin 和客户端头。它在当前账号的实测中返回真正的结束原因，避免 IDE 路线正常 EOF 却缺 stopReason 的问题。原有 auto/IDE 配置不自动迁移；启用 endpointFallback 时 CLI 失败仍可能降级到 IDE，API Key 则不会降级到 IDE。
+
+真实 tokenUsage 优先于上下文百分比和本地估算，显式零值也不会被估算覆盖。输入缓存桶按互斥分量汇总；不存在的 TTL 明细不再伪造。invalidStateEvent 被作为错误处理。无输出时的连接失败、429/5xx 最多在同入口重试一次，遵循短 Retry-After；超过 5 秒的 Retry-After 直接报错，不提前重试。总超时不因重试延长，输出后不重放。
+
+管理员可使用 `POST /admin/api/accounts/{id}/diagnose`，沿用 `X-Admin-Password` 鉴权。请求格式为 `{"request":{"model":"claude-sonnet-5","messages":[{"role":"user","content":"Reply OK"}]},"repeat":2,"endpoint":"cli"}`。省略 endpoint 则使用当前路由。最多重复 2 次、请求 256 KiB、max_tokens 8192；这是真实生成，会消耗额度。只返回入口状态/耗时、事件数量和尾部顺序、白名单数值用量、结束原因及 cache_status（unreported/reported/hit），不返回提示词、回答、凭据或工具参数，也不写入持久诊断日志。`success` 表示上游调用/解析无错误，完整性仍要结合 stop_reason 判断。
 
 Claude Messages、Chat Completions、Responses 的流式/非流式请求共用上游超时、思考解析和完成判定。默认 `compatible` 策略只接受正常 EOF 且已有非空回答、没有未闭合思考块的缺失 stopReason 响应；不重新生成答案，保守标为 Claude `max_tokens` / Chat `length` / Responses `incomplete`，不再伪造 `end_turn`。这只是“无法证明完整”的协议映射，并不表示实际触及 token 上限。`KIRO_STREAM_EOF_POLICY=strict` 则将缺失终止信号视为错误，仅在未输出内容时允许有界重试。
 
@@ -138,6 +146,8 @@ Claude Messages、Chat Completions、Responses 的流式/非流式请求共用�
 首事件预算覆盖生成 HTTP 请求的响应头等待，metadata/心跳不算首个生成事件；真实文本/思考/工具事件后切换为空闲预算。总预算不被心跳、上游活动或重试延长。OAuth 刷新/Profile 发现仍使用原有独立 HTTP 超时，不能视为生成首事件时限内可立即取消的操作。
 
 参考实现：`vagmr/kiro2api-rs`（MIT，心跳/标签边界）、`mydisha/keirouter`（MIT）、`jwadow/kiro-gateway`（AGPL-3，超时/完成状态）、`justlovemaki/AIClient2API`（GPL-3，effort 适配）。本次采用独立 Go 实现并复用本仓库的解析/重试基础设施，未复制这些项目代码；不将 GPL/AGPL 源文件直接混入本仓库 MIT 代码。
+
+后续协议核验还参考 `d-kuro/kirocc`（Apache-2.0，CLI 请求协议、tokenUsage 分桶）和 `dat-lequoc/dsh-kiro`（tokenUsage 缺失时不声称已报告）。仅核对协议行为并独立实现，缓存是否生效以部署端实测元数据为准。
 
 ## 出站代理
 

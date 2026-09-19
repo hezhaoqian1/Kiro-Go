@@ -77,7 +77,6 @@ type Handler struct {
 	cachedModels       []ModelInfo
 	modelsCacheMu      sync.RWMutex
 	modelsCacheTime    int64
-	promptCache        *promptCacheTracker
 	tokenRefreshMu     sync.Mutex
 	credentialImportMu sync.Mutex
 	// 请求日志 (环形缓冲区，包含成功和失败)
@@ -263,7 +262,6 @@ func NewHandler() *Handler {
 		startTime:            time.Now().Unix(),
 		stopRefresh:          make(chan struct{}),
 		stopStatsSaver:       make(chan struct{}),
-		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
 		microsoftSelections:  make(map[string]*microsoftProfileSelection),
 		microsoftCanceled:    make(map[string]time.Time),
 		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
@@ -868,7 +866,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
-	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
@@ -904,14 +901,14 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	if req.Stream {
-		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1453,7 +1450,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -1578,6 +1575,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, upstreamStopReason)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+		resp.Usage.CacheReported = hasPromptCacheUsage(cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if hasPromptCacheBreakdown(cacheUsage) {
@@ -4340,10 +4338,10 @@ func (h *Handler) apiUpdateEndpointConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	valid := map[string]bool{"auto": true, "kiro": true, "codewhisperer": true, "amazonq": true}
+	valid := map[string]bool{"auto": true, "cli": true, "kiro": true, "codewhisperer": true, "amazonq": true}
 	if !valid[req.PreferredEndpoint] {
 		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid endpoint, must be: auto, kiro, codewhisperer, or amazonq"})
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid endpoint, must be: auto, cli, kiro, codewhisperer, or amazonq"})
 		return
 	}
 

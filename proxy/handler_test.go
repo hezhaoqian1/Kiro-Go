@@ -62,7 +62,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 		requestTokens = append(requestTokens, token)
 		// Fail the first attempted account (whichever it is) so the handler
 		// is forced to add it to `excluded` and retry the other one.
-		if len(requestTokens) == 1 {
+		if token == requestTokens[0] {
 			http.Error(w, "temporary upstream failure", http.StatusInternalServerError)
 			return
 		}
@@ -91,8 +91,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		pool: p,
 	}
 
 	payload := &KiroPayload{}
@@ -103,18 +102,18 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "")
+	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if len(requestTokens) != 2 {
-		t.Fatalf("expected two account attempts, got %v", requestTokens)
+	if len(requestTokens) != 3 {
+		t.Fatalf("expected bounded retries then next account, got %v", requestTokens)
 	}
-	if requestTokens[0] == requestTokens[1] {
+	if requestTokens[0] != requestTokens[1] || requestTokens[0] == requestTokens[2] {
 		t.Fatalf("expected first account to be excluded before retry, got %v", requestTokens)
 	}
-	tokenSet := map[string]bool{requestTokens[0]: true, requestTokens[1]: true}
+	tokenSet := map[string]bool{requestTokens[0]: true, requestTokens[2]: true}
 	if !tokenSet["token-first"] || !tokenSet["token-second"] {
 		t.Fatalf("expected both accounts to be tried, got %v", requestTokens)
 	}
@@ -161,7 +160,7 @@ func TestOpenAIHandlerPropagatesClientCancellation(t *testing.T) {
 
 	p := accountpool.GetPool()
 	p.Reload()
-	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	h := &Handler{pool: p}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude-sonnet-4.5","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.handleOpenAIChat(rec, req)
@@ -618,8 +617,7 @@ func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		pool: p,
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
@@ -680,8 +678,7 @@ func TestClaudeResponsePreservesUpstreamMaxTokensStopReason(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		pool: p,
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
@@ -739,8 +736,7 @@ func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := &Handler{
-		pool:        p,
-		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+		pool: p,
 	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{

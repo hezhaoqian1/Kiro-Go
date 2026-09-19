@@ -197,16 +197,29 @@ type ClaudeResponse struct {
 }
 
 type ClaudeCacheCreationUsage struct {
-	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens,omitempty"`
-	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
 }
 
 type ClaudeUsage struct {
+	CacheReported            bool                      `json:"-"`
 	InputTokens              int                       `json:"input_tokens"`
 	OutputTokens             int                       `json:"output_tokens"`
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+}
+
+func (usage ClaudeUsage) MarshalJSON() ([]byte, error) {
+	type wireUsage ClaudeUsage
+	if !usage.CacheReported {
+		return json.Marshal(wireUsage(usage))
+	}
+	return json.Marshal(struct {
+		wireUsage
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	}{wireUsage: wireUsage(usage), CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheReadInputTokens: usage.CacheReadInputTokens})
 }
 
 // ==================== Claude -> Kiro 转换 ====================

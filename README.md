@@ -121,11 +121,19 @@ Explicit `thinking.type=disabled` overrides the suffix. Enabled mode honors an e
 
 ## Prompt Cache
 
+On 2026-09-19, repeated-prefix diagnostics on the deployed account showed text/contextUsage/metering events on IDE. CLI runtime additionally supplied metadata and a real stop reason, but neither route supplied tokenUsage/cache counters. This means unreported, not a confirmed zero hit rate; credit reductions cannot be converted into cache token counts.
+
 Claude tool `cache_control` directives map to `cachePoint` entries in `userInputMessageContext.tools`. This request mapping does not prove cache creation, hits, or discounts. System and message cache directives are accepted without generating breakpoints; their normal content is retained. Controlled tests on the deployed endpoint returned HTTP 400 `Improperly formed request` with standalone history cachePoint entries, while the same request succeeded without them, so those history entries are no longer emitted.
 
 The proxy does not infer cache hits from local fingerprints, account IDs, or TTLs. Cache statistics rely on upstream usage; the 5-minute/1-hour breakdown requires upstream evidence and TTL selection is not guaranteed. Repeated tool-prefix requests on the deployed endpoint, both streamed and buffered, exposed no cache statistics. Anthropic Prompt Caching and its discounts therefore remain unverified. Streaming is independent of caching: setting `stream=false` does not enable caching. BirdSub2Api charges reflect gateway pricing, not proof of cache savings in Kiro credits.
 
 ## Shared Streaming and Completion Policy
+
+Endpoint settings now offer `Kiro CLI (runtime)` (`preferredEndpoint=cli`) for OAuth and API Key accounts. OAuth uses the profile data-plane region; API keys use their configured region. The CLI route uses its own JSON protocol, origin and client headers. It returns real stop reasons on the tested account, avoiding IDE's missing-stopReason EOF ambiguity. Existing auto/IDE settings are not migrated automatically. With endpointFallback enabled, OAuth CLI failures can still fall back to IDE; API keys never use IDE fallback.
+
+Reported tokenUsage takes precedence over context percentages and local estimates, including explicit zero counters. Disjoint input/cache buckets are combined without inventing TTL breakdowns. invalidStateEvent fails the stream. Before output, connection failures and 429/5xx receive at most one same-endpoint retry; short Retry-After is honored, while delays above 5 seconds fail without retrying early. Retries do not extend the total deadline or replay visible output.
+
+Admins can call `POST /admin/api/accounts/{id}/diagnose` with existing `X-Admin-Password` authentication and a body such as `{"request":{"model":"claude-sonnet-5","messages":[{"role":"user","content":"Reply OK"}]},"repeat":2,"endpoint":"cli"}`. Omit endpoint to use configured routing. Limits: 2 repeats, 256 KiB body, 8192 max_tokens, shared total deadline. These are real billable generations. Results contain attempt timing/status, event counts/tail order, allowlisted numeric usage, stop reason and cache_status (unreported/reported/hit); no prompts, generated text, credentials or tool arguments are returned or persisted as diagnostic logs. Success means upstream transport/parsing succeeded; inspect stop_reason separately for completion.
 
 Messages, Chat Completions, and Responses share upstream deadlines, thinking normalization, and integrity checks for both streaming and buffered requests. With the default `compatible` EOF policy, clean EOF with non-whitespace answer text and no open thinking block is retained without regeneration, but conservatively marked Claude `max_tokens`, Chat `length`, or Responses `incomplete`. This means completion could not be verified, not that a token limit was actually reached. It no longer fabricates `end_turn`. Set `KIRO_STREAM_EOF_POLICY=strict` to reject missing completion signals; bounded retries are allowed only before visible output.
 
@@ -138,6 +146,8 @@ Streaming starts with a Claude ping or OpenAI SSE comment, committing HTTP 200 b
 The first-event deadline includes generation HTTP response headers; metadata does not count as generation progress. Text/reasoning/tool activity switches to the idle read budget. Activity, heartbeats, and retries do not extend the overall deadline. OAuth refresh/profile discovery still use their existing independent HTTP timeouts and are not immediately interruptible under the generation first-event deadline.
 
 Design references: `vagmr/kiro2api-rs` (MIT, heartbeat/tag boundaries), `mydisha/keirouter` (MIT), `jwadow/kiro-gateway` (AGPL-3, timeout/completion policy), and `justlovemaki/AIClient2API` (GPL-3, effort adaptation). This is an independent Go implementation reusing this repository's parser/retry infrastructure; no source was copied from those projects, preserving this repository's MIT licensing boundary.
+
+Further protocol checks referenced `d-kuro/kirocc` (Apache-2.0, CLI protocol and tokenUsage buckets) and `dat-lequoc/dsh-kiro` (distinguishing missing usage). These are independent implementations of observed protocol behavior, not evidence of cache hits on every account.
 
 ## Outbound Proxy
 

@@ -17,23 +17,26 @@ type streamDiagnosticAttempt struct {
 }
 
 type streamDiagnostic struct {
-	Success       bool                      `json:"success"`
-	Error         string                    `json:"error,omitempty"`
-	Model         string                    `json:"model"`
-	Thinking      bool                      `json:"thinking"`
-	Attempts      []streamDiagnosticAttempt `json:"attempts"`
-	Events        map[string]int            `json:"events"`
-	NumericFields map[string]float64        `json:"numeric_fields"`
-	FirstEventMS  *int64                    `json:"first_event_ms,omitempty"`
-	DurationMS    int64                     `json:"duration_ms"`
-	TextBytes     int                       `json:"text_bytes"`
-	ThinkingBytes int                       `json:"thinking_bytes"`
-	ToolCalls     int                       `json:"tool_calls"`
-	StopReason    string                    `json:"stop_reason,omitempty"`
-	InputTokens   int                       `json:"input_tokens"`
-	OutputTokens  int                       `json:"output_tokens"`
-	CacheUsage    map[string]interface{}    `json:"cache_usage"`
-	Started       time.Time                 `json:"-"`
+	Success            bool                      `json:"success"`
+	Error              string                    `json:"error,omitempty"`
+	Model              string                    `json:"model"`
+	Thinking           bool                      `json:"thinking"`
+	Attempts           []streamDiagnosticAttempt `json:"attempts"`
+	Events             map[string]int            `json:"events"`
+	TailEvents         []string                  `json:"tail_events"`
+	TokenUsageReported bool                      `json:"token_usage_reported"`
+	CacheStatus        string                    `json:"cache_status"`
+	NumericFields      map[string]float64        `json:"numeric_fields"`
+	FirstEventMS       *int64                    `json:"first_event_ms,omitempty"`
+	DurationMS         int64                     `json:"duration_ms"`
+	TextBytes          int                       `json:"text_bytes"`
+	ThinkingBytes      int                       `json:"thinking_bytes"`
+	ToolCalls          int                       `json:"tool_calls"`
+	StopReason         string                    `json:"stop_reason,omitempty"`
+	InputTokens        int                       `json:"input_tokens"`
+	OutputTokens       int                       `json:"output_tokens"`
+	CacheUsage         map[string]interface{}    `json:"cache_usage"`
+	Started            time.Time                 `json:"-"`
 }
 
 func (diagnostic *streamDiagnostic) observe(eventType string, event map[string]interface{}) {
@@ -47,6 +50,10 @@ func (diagnostic *streamDiagnostic) observe(eventType string, event map[string]i
 		eventType = "other"
 	}
 	diagnostic.Events[eventType]++
+	diagnostic.TailEvents = append(diagnostic.TailEvents, eventType)
+	if len(diagnostic.TailEvents) > 16 {
+		diagnostic.TailEvents = diagnostic.TailEvents[1:]
+	}
 	if eventType != "metadataEvent" && eventType != "meteringEvent" && eventType != "contextUsageEvent" {
 		return
 	}
@@ -140,6 +147,9 @@ func (h *Handler) apiDiagnoseAccount(w http.ResponseWriter, r *http.Request, id 
 		var cacheUsage promptCacheUsage
 		diagnostic := streamDiagnostic{Model: model, Thinking: thinking, Events: make(map[string]int), NumericFields: make(map[string]float64), CacheUsage: make(map[string]interface{}), Started: time.Now()}
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) {
+				diagnostic.TokenUsageReported = usage.InputReported || usage.OutputReported
+			},
 			OnEvent: diagnostic.observe,
 			OnAttempt: func(endpoint string, status int) {
 				diagnostic.Attempts = append(diagnostic.Attempts, streamDiagnosticAttempt{Endpoint: endpoint, Status: status, AtMS: time.Since(diagnostic.Started).Milliseconds()})
@@ -160,6 +170,13 @@ func (h *Handler) apiDiagnoseAccount(w http.ResponseWriter, r *http.Request, id 
 		}
 		err := CallKiroAPIContext(ctx, account, payload, callback)
 		diagnostic.CacheUsage = buildClaudeUsageMap(diagnostic.InputTokens, diagnostic.OutputTokens, cacheUsage, hasPromptCacheUsage(cacheUsage))
+		diagnostic.CacheStatus = "unreported"
+		if hasPromptCacheUsage(cacheUsage) {
+			diagnostic.CacheStatus = "reported"
+		}
+		if cacheUsage.CacheReadInputTokens > 0 {
+			diagnostic.CacheStatus = "hit"
+		}
 		diagnostic.DurationMS = time.Since(diagnostic.Started).Milliseconds()
 		diagnostic.Success = err == nil
 		if err != nil {

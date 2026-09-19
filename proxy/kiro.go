@@ -333,7 +333,9 @@ func endpointsForAccount(account *config.Account) []kiroEndpoint {
 // cliRuntimeURL builds the regional Kiro CLI runtime URL.
 func cliRuntimeURL(account *config.Account) string {
 	region := "us-east-1"
-	if account != nil {
+	if account != nil && !config.IsAPIKeyAccount(account) {
+		region = kiroRegion(account)
+	} else if account != nil {
 		if r := strings.TrimSpace(account.Region); r != "" {
 			region = r
 		}
@@ -344,6 +346,13 @@ func cliRuntimeURL(account *config.Account) string {
 // getSortedEndpoints returns endpoints ordered by user preference, with optional fallback.
 func getSortedEndpoints(preferred string) []kiroEndpoint {
 	fallback := config.GetEndpointFallback()
+	if preferred == "cli" {
+		endpoints := []kiroEndpoint{kiroCLIEndpoint}
+		if fallback {
+			endpoints = append(endpoints, kiroEndpoints...)
+		}
+		return endpoints
+	}
 
 	var primary int
 	switch preferred {
@@ -511,14 +520,12 @@ endpointLoop:
 				if !isRetryableStreamError(err) {
 					return err
 				}
-				continue endpointLoop
-			}
-
-			if resp.StatusCode == 429 {
-				resp.Body.Close()
-				guard.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+				if streamAttempt < maxStreamAttemptsPerEndpoint {
+					if waitErr := streamRetryWait(ctx, streamRetryBackoff); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
 				continue endpointLoop
 			}
 
@@ -535,7 +542,42 @@ endpointLoop:
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 					return lastErr
 				}
+				if (resp.StatusCode == 429 || resp.StatusCode >= 500) && streamAttempt < maxStreamAttemptsPerEndpoint {
+					delay := upstreamRetryDelay(resp.Header.Get("Retry-After"))
+					if delay > 5*time.Second {
+						return lastErr
+					}
+					if waitErr := streamRetryWait(ctx, delay); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
 				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+				continue endpointLoop
+			}
+			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json") {
+				errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				readErr = guard.Result(readErr)
+				resp.Body.Close()
+				guard.Close()
+				if readErr != nil {
+					return readErr
+				}
+				kind, transient := upstreamJSONErrorKind(errBody)
+				lastErr = fmt.Errorf("%w: %s from %s (HTTP 200 JSON instead of event stream)", errKiroEventStreamUpstream, kind, ep.Name)
+				if !transient {
+					return lastErr
+				}
+				if streamAttempt < maxStreamAttemptsPerEndpoint {
+					delay := upstreamRetryDelay(resp.Header.Get("Retry-After"))
+					if delay > 5*time.Second {
+						return lastErr
+					}
+					if waitErr := streamRetryWait(ctx, delay); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
 				continue endpointLoop
 			}
 
@@ -596,11 +638,46 @@ endpointLoop:
 }
 
 func isRetryableStreamError(err error) bool {
+	if errors.Is(err, errKiroEventStreamUpstream) {
+		return false
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var netErr net.Error
 	return !errors.As(err, &netErr) || !netErr.Timeout()
+}
+
+func upstreamRetryDelay(value string) time.Duration {
+	delay := streamRetryBackoff
+	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
+		if seconds >= 86400 {
+			return 24 * time.Hour
+		}
+		delay = time.Duration(seconds) * time.Second
+	} else if until, err := http.ParseTime(value); err == nil && time.Until(until) > delay {
+		delay = time.Until(until)
+	}
+	return delay
+}
+
+func upstreamJSONErrorKind(body []byte) (string, bool) {
+	var envelope map[string]interface{}
+	if json.Unmarshal(body, &envelope) != nil {
+		return "InvalidJSONResponse", false
+	}
+	kind := firstStringField(envelope, "__type", "code", "type")
+	if index := strings.LastIndex(kind, "#"); index >= 0 {
+		kind = kind[index+1:]
+	}
+	switch kind {
+	case "ThrottlingException", "TooManyRequestsException", "InternalServerException", "ServiceUnavailableException":
+		return kind, true
+	case "AccessDeniedException", "UnauthorizedException", "ValidationException", "ResourceNotFoundException":
+		return kind, false
+	default:
+		return "UnexpectedJSONResponse", false
+	}
 }
 
 func accountEmailForLog(account *config.Account) string {
@@ -801,65 +878,13 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	return emitted, nil
 }
 
-func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
-	candidates := []map[string]interface{}{event}
-	collectUsageMaps(event, &candidates)
-
-	inputTokens := currentInputTokens
-	outputTokens := currentOutputTokens
-
-	for _, usage := range candidates {
-		if usage == nil {
-			continue
-		}
-
-		if v, ok := readTokenNumber(usage,
-			"outputTokens", "completionTokens", "totalOutputTokens",
-			"output_tokens", "completion_tokens", "total_output_tokens",
-		); ok {
-			outputTokens = v
-		}
-
-		if v, ok := readTokenNumber(usage,
-			"inputTokens", "promptTokens", "totalInputTokens",
-			"input_tokens", "prompt_tokens", "total_input_tokens",
-		); ok {
-			inputTokens = v
-			continue
-		}
-
-		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
-		cacheRead, _ := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens")
-		cacheWrite, _ := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens")
-		if uncached+cacheRead+cacheWrite > 0 {
-			inputTokens = uncached + cacheRead + cacheWrite
-			continue
-		}
-
-		total, ok := readTokenNumber(usage, "totalTokens", "total_tokens")
-		if ok && total > 0 {
-			candidateOutput := outputTokens
-			if v, vok := readTokenNumber(usage,
-				"outputTokens", "completionTokens", "totalOutputTokens",
-				"output_tokens", "completion_tokens", "total_output_tokens",
-			); vok {
-				candidateOutput = v
-			}
-			if total-candidateOutput > 0 {
-				inputTokens = total - candidateOutput
-			}
-		}
-	}
-
-	return inputTokens, outputTokens
-}
-
 func promptCacheUsageFromEvent(event map[string]interface{}) promptCacheUsage {
 	candidates := []map[string]interface{}{event}
 	collectUsageMaps(event, &candidates)
 	var usage promptCacheUsage
 	for _, candidate := range candidates {
 		_, readReported := readTokenNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens")
+		usage.BreakdownReported = usage.BreakdownReported || cacheBreakdownPresent(candidate)
 		_, writeReported := readTokenNumber(candidate, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteInputTokens", "cache_write_input_tokens")
 		usage.Reported = usage.Reported || readReported || writeReported
 		usage.CacheReadInputTokens = maxInt(usage.CacheReadInputTokens, readUsageNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens"))

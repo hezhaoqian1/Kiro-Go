@@ -366,7 +366,7 @@ func TestEndpointsForAccountUsesCLIForAPIKey(t *testing.T) {
 	if eps[0].Origin != "KIRO_CLI" {
 		t.Fatalf("origin = %q", eps[0].Origin)
 	}
-	if got := cliRuntimeURL(&config.Account{Region: "eu-central-1"}); got != "https://runtime.eu-central-1.kiro.dev/" {
+	if got := cliRuntimeURL(&config.Account{AuthMethod: "api_key", Region: "eu-central-1"}); got != "https://runtime.eu-central-1.kiro.dev/" {
 		t.Fatalf("cli url = %q", got)
 	}
 }
