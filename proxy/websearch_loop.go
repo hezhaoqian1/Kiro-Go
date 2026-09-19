@@ -176,7 +176,9 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 		var upstreamStopReason string
 		var sawReasoning bool
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(t string, isThinking bool) {
 				if isThinking {
 					sawReasoning = true
@@ -212,6 +214,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			return len(text), len(toolUses), upstreamStopReason, sawReasoning
 		}
 		reset := func() {
+			tokenUsage = reportedTokenUsage{}
 			text, upstreamStopReason, stopOverride = "", "", ""
 			toolUses = nil
 			inputTokens, realInputTokens, credits, sawReasoning = 0, 0, 0, false
@@ -232,11 +235,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 		if upstreamStopReason != "" && upstreamStopReason != "tool_use" {
 			stopOverride = upstreamStopReason
 		}
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		inputTokens, _ = tokenUsage.resolve(inputTokens, 0, realInputTokens, estimatedInputTokens, 0)
 
 		return &webSearchRoundOutcome{
 			text:               text,

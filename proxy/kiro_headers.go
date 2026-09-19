@@ -22,6 +22,14 @@ func buildStreamingHeaderValues(account *config.Account, host string) kiroHeader
 	return buildKiroHeaderValues(account, host, "codewhispererstreaming", kiroStreamingSDKVersion, "m/E")
 }
 
+func buildCLIStreamingHeaderValues(host string) kiroHeaderValues {
+	return kiroHeaderValues{
+		Host:         host,
+		UserAgent:    "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI",
+		AmzUserAgent: "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
+	}
+}
+
 func buildRuntimeHeaderValues(account *config.Account, host string) kiroHeaderValues {
 	return buildKiroHeaderValues(account, host, "codewhispererruntime", kiroRuntimeSDKVersion, "m/N,E")
 }

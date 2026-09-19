@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"kiro-go/config"
 	"net/http"
 	"time"
 )
+
+type diagnosticEndpointKey struct{}
 
 type streamDiagnosticAttempt struct {
 	Endpoint string `json:"endpoint"`
@@ -68,8 +71,9 @@ func (diagnostic *streamDiagnostic) observeNumbers(path string, fields map[strin
 
 func (h *Handler) apiDiagnoseAccount(w http.ResponseWriter, r *http.Request, id string) {
 	var input struct {
-		Request ClaudeRequest `json:"request"`
-		Repeat  int           `json:"repeat"`
+		Request  ClaudeRequest `json:"request"`
+		Repeat   int           `json:"repeat"`
+		Endpoint string        `json:"endpoint"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&input); err != nil {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "Expected a diagnostic request up to 256 KiB")
@@ -77,6 +81,10 @@ func (h *Handler) apiDiagnoseAccount(w http.ResponseWriter, r *http.Request, id 
 	}
 	if input.Repeat == 0 {
 		input.Repeat = 1
+	}
+	if input.Endpoint != "" && input.Endpoint != "cli" {
+		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "endpoint must be omitted or cli")
+		return
 	}
 	if input.Repeat < 1 || input.Repeat > 2 {
 		h.sendClaudeError(w, http.StatusBadRequest, "invalid_request_error", "repeat must be 1 or 2")
@@ -119,6 +127,9 @@ func (h *Handler) apiDiagnoseAccount(w http.ResponseWriter, r *http.Request, id 
 	}
 	ctx, cancel := streamLifetime(r.Context())
 	defer cancel()
+	if input.Endpoint == "cli" {
+		ctx = context.WithValue(ctx, diagnosticEndpointKey{}, "cli")
+	}
 	if err := h.ensureValidToken(account); err != nil {
 		h.sendClaudeError(w, http.StatusBadGateway, "api_error", "Token refresh failed")
 		return

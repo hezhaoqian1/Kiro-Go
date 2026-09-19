@@ -12,6 +12,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -284,6 +285,7 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
+	OnTokenUsage   func(usage reportedTokenUsage)
 	OnEvent        func(eventType string, event map[string]interface{})
 	OnAttempt      func(endpoint string, status int)
 	OnActivity     func()
@@ -427,11 +429,14 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 
 	// Build endpoint list ordered by configuration / credential type.
 	endpoints := resolveKiroEndpoints(account)
-	isAPIKey := config.IsAPIKeyAccount(account)
+	if ctx.Value(diagnosticEndpointKey{}) == "cli" {
+		endpoints = []kiroEndpoint{kiroCLIEndpoint}
+	}
 
 	var lastErr error
 endpointLoop:
 	for epIndex, ep := range endpoints {
+		isCLI := ep.Origin == "KIRO_CLI"
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -441,7 +446,7 @@ endpointLoop:
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if isAPIKey {
+		if isCLI {
 			epURL = cliRuntimeURL(account)
 		}
 
@@ -451,6 +456,9 @@ endpointLoop:
 			host = parsedURL.Host
 		}
 		headerValues := buildStreamingHeaderValues(account, host)
+		if isCLI {
+			headerValues = buildCLIStreamingHeaderValues(host)
+		}
 		invocationID := uuid.New().String()
 
 		for streamAttempt := 1; streamAttempt <= maxStreamAttemptsPerEndpoint; streamAttempt++ {
@@ -463,7 +471,7 @@ endpointLoop:
 				lastErr = err
 				continue endpointLoop
 			}
-			if isAPIKey {
+			if isCLI {
 				req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 			} else {
 				req.Header.Set("Content-Type", "application/json")
@@ -473,11 +481,11 @@ endpointLoop:
 				req.Header.Set("X-Amz-Target", ep.AmzTarget)
 			}
 			applyKiroBaseHeaders(req, account, headerValues)
-			if !isAPIKey {
+			if !isCLI {
 				req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 			}
 			// CLI captures use optout=false; IDE path keeps true.
-			if isAPIKey {
+			if isCLI {
 				req.Header.Set("x-amzn-codewhisperer-optout", "false")
 			} else {
 				req.Header.Set("x-amzn-codewhisperer-optout", "true")
@@ -631,6 +639,7 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
+	var tokenUsage reportedTokenUsage
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var cacheUsage promptCacheUsage
@@ -702,8 +711,12 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		if callback.OnEvent != nil {
 			callback.OnEvent(headers[":event-type"], event)
 		}
-		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
-		cacheUsage = mergePromptCacheUsage(cacheUsage, promptCacheUsageFromEvent(event))
+		switch headers[":event-type"] {
+		case "metadataEvent", "meteringEvent", "usageEvent", "tokenUsageEvent", "contextUsageEvent":
+			tokenUsage.update(event)
+			inputTokens, outputTokens = tokenUsage.InputTokens, tokenUsage.OutputTokens
+			cacheUsage = mergePromptCacheUsage(cacheUsage, promptCacheUsageFromEvent(event))
+		}
 
 		switch headers[":event-type"] {
 		case "assistantResponseEvent":
@@ -756,6 +769,8 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 					callback.OnStopReason(canonical)
 				}
 			}
+		case "invalidStateEvent":
+			return emitted, fmt.Errorf("%w: invalidStateEvent", errKiroEventStreamUpstream)
 		}
 	}
 
@@ -773,6 +788,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		for _, percentage := range contextUsagePercentages {
 			callback.OnContextUsage(percentage)
 		}
+	}
+	if callback.OnTokenUsage != nil {
+		callback.OnTokenUsage(tokenUsage)
 	}
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
@@ -841,20 +859,34 @@ func promptCacheUsageFromEvent(event map[string]interface{}) promptCacheUsage {
 	collectUsageMaps(event, &candidates)
 	var usage promptCacheUsage
 	for _, candidate := range candidates {
+		_, readReported := readTokenNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens")
+		_, writeReported := readTokenNumber(candidate, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteInputTokens", "cache_write_input_tokens")
+		usage.Reported = usage.Reported || readReported || writeReported
 		usage.CacheReadInputTokens = maxInt(usage.CacheReadInputTokens, readUsageNumber(candidate, "cacheReadInputTokens", "cache_read_input_tokens"))
 		usage.CacheCreationInputTokens = maxInt(usage.CacheCreationInputTokens, readUsageNumber(candidate, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteInputTokens", "cache_write_input_tokens"))
 		usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(candidate, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
 		usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(candidate, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
 		if nested, ok := candidate["cacheCreation"].(map[string]interface{}); ok {
+			usage.BreakdownReported = cacheBreakdownPresent(nested) || usage.BreakdownReported
 			usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(nested, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
 			usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(nested, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
 		}
 		if nested, ok := candidate["cache_creation"].(map[string]interface{}); ok {
+			usage.BreakdownReported = cacheBreakdownPresent(nested) || usage.BreakdownReported
 			usage.CacheCreation5mInputTokens = maxInt(usage.CacheCreation5mInputTokens, readUsageNumber(nested, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"))
 			usage.CacheCreation1hInputTokens = maxInt(usage.CacheCreation1hInputTokens, readUsageNumber(nested, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"))
 		}
 	}
+	usage.BreakdownReported = usage.BreakdownReported || cacheBreakdownPresent(event)
+	usage.Reported = usage.Reported || usage.BreakdownReported
+	usage.CacheCreationInputTokens = maxInt(usage.CacheCreationInputTokens, usage.CacheCreation5mInputTokens+usage.CacheCreation1hInputTokens)
 	return usage
+}
+
+func cacheBreakdownPresent(fields map[string]interface{}) bool {
+	_, fiveMinutes := readTokenNumber(fields, "ephemeral5mInputTokens", "ephemeral_5m_input_tokens")
+	_, oneHour := readTokenNumber(fields, "ephemeral1hInputTokens", "ephemeral_1h_input_tokens")
+	return fiveMinutes || oneHour
 }
 
 func readUsageNumber(values map[string]interface{}, keys ...string) int {
@@ -864,6 +896,8 @@ func readUsageNumber(values map[string]interface{}, keys ...string) int {
 
 func mergePromptCacheUsage(current, incoming promptCacheUsage) promptCacheUsage {
 	return promptCacheUsage{
+		Reported:                   current.Reported || incoming.Reported,
+		BreakdownReported:          current.BreakdownReported || incoming.BreakdownReported,
 		CacheCreationInputTokens:   maxInt(current.CacheCreationInputTokens, incoming.CacheCreationInputTokens),
 		CacheReadInputTokens:       maxInt(current.CacheReadInputTokens, incoming.CacheReadInputTokens),
 		CacheCreation5mInputTokens: maxInt(current.CacheCreation5mInputTokens, incoming.CacheCreation5mInputTokens),
@@ -951,21 +985,24 @@ func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
 		}
 		switch n := v.(type) {
 		case float64:
-			return int(n), true
+			if !math.IsNaN(n) && !math.IsInf(n, 0) && n >= 0 && n < float64(math.MaxInt) && math.Trunc(n) == n {
+				return int(n), true
+			}
 		case int:
-			return n, true
+			if n >= 0 {
+				return n, true
+			}
 		case int64:
-			return int(n), true
+			if n >= 0 && uint64(n) <= uint64(math.MaxInt) {
+				return int(n), true
+			}
 		case json.Number:
-			if parsed, err := n.Int64(); err == nil {
+			if parsed, err := n.Int64(); err == nil && parsed >= 0 && uint64(parsed) <= uint64(math.MaxInt) {
 				return int(parsed), true
 			}
 		case string:
-			if parsed, err := strconv.Atoi(n); err == nil {
+			if parsed, err := strconv.Atoi(n); err == nil && parsed >= 0 {
 				return parsed, true
-			}
-			if parsed, err := strconv.ParseFloat(n, 64); err == nil {
-				return int(parsed), true
 			}
 		}
 	}

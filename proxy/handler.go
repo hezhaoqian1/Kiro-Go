@@ -1139,7 +1139,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 		}
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1217,6 +1219,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			rawContentBuilder.Reset()
 			rawThinkingBuilder.Reset()
 			toolUses = nil
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -1257,17 +1260,13 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
 		outputContent := strings.TrimSpace(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses))
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1480,7 +1479,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		var realInputTokens int
 		var upstreamStopReason string
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					thinkingContent += text
@@ -1517,6 +1518,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			content = ""
 			thinkingContent = ""
 			toolUses = nil
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -1548,12 +1550,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses))
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1582,7 +1580,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
-		if hasPromptCacheUsage(cacheUsage) {
+		if hasPromptCacheBreakdown(cacheUsage) {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,
 				Ephemeral1hInputTokens: cacheUsage.CacheCreation1hInputTokens,
@@ -1850,7 +1848,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			}
 		}
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -1928,6 +1928,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			rawReasoningBuilder.Reset()
 			toolCalls = nil
 			toolCallIndex = 0
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -1964,21 +1965,18 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			sendChunk("", 3)
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
 		outputContent := strings.TrimSpace(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
 		if !thinking {
 			reasoningOutput = ""
 		}
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+		estimatedOutputTokens := estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
 		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			estimatedOutputTokens += estimateApproxTokens(tc.Function.Name)
+			estimatedOutputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimatedOutputTokens)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2044,7 +2042,9 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		var realInputTokens int
 		var upstreamStopReason string
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					reasoningContent += text
@@ -2071,6 +2071,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			content = ""
 			reasoningContent = ""
 			toolUses = nil
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -2099,12 +2100,8 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses))
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

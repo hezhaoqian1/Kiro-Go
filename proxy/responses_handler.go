@@ -164,7 +164,9 @@ func (h *Handler) handleResponsesNonStream(
 		var realInputTokens int
 		var upstreamStopReason string
 
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if isThinking {
 					reasoningContent += text
@@ -191,6 +193,7 @@ func (h *Handler) handleResponsesNonStream(
 			content = ""
 			reasoningContent = ""
 			toolUses = nil
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -220,12 +223,8 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses))
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -409,7 +408,9 @@ func (h *Handler) handleResponsesStream(
 		)
 
 		output := newResponsesStreamOutput(send)
+		var tokenUsage reportedTokenUsage
 		callback := &KiroStreamCallback{
+			OnTokenUsage: func(usage reportedTokenUsage) { tokenUsage = usage },
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
@@ -449,6 +450,7 @@ func (h *Handler) handleResponsesStream(
 			reasoningText.Reset()
 			output = newResponsesStreamOutput(send)
 			toolUses = nil
+			tokenUsage = reportedTokenUsage{}
 			inputTokens = 0
 			outputTokens = 0
 			credits = 0
@@ -496,12 +498,8 @@ func (h *Handler) handleResponsesStream(
 		status, _ := mapResponsesCompletion(upstreamStopReason)
 		output.finish(status)
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, 0)
+		inputTokens, outputTokens = tokenUsage.resolve(inputTokens, outputTokens, realInputTokens, estimatedInputTokens, estimateOpenAIOutputTokens(finalContent, reasoning, toolUses))
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

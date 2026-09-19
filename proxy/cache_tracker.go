@@ -21,6 +21,8 @@ const defaultMinCacheableTokens = 1024
 const opusMinCacheableTokens = 4096
 
 type promptCacheUsage struct {
+	Reported                   bool
+	BreakdownReported          bool
 	CacheCreationInputTokens   int
 	CacheReadInputTokens       int
 	CacheCreation5mInputTokens int
@@ -511,7 +513,7 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 }
 
 func hasPromptCacheUsage(usage promptCacheUsage) bool {
-	return usage.CacheCreationInputTokens > 0 || usage.CacheReadInputTokens > 0 ||
+	return usage.Reported || usage.CacheCreationInputTokens > 0 || usage.CacheReadInputTokens > 0 ||
 		usage.CacheCreation5mInputTokens > 0 || usage.CacheCreation1hInputTokens > 0
 }
 
@@ -525,11 +527,17 @@ func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, 
 	}
 	result["cache_creation_input_tokens"] = usage.CacheCreationInputTokens
 	result["cache_read_input_tokens"] = usage.CacheReadInputTokens
-	result["cache_creation"] = map[string]int{
-		"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
-		"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+	if hasPromptCacheBreakdown(usage) {
+		result["cache_creation"] = map[string]int{
+			"ephemeral_5m_input_tokens": usage.CacheCreation5mInputTokens,
+			"ephemeral_1h_input_tokens": usage.CacheCreation1hInputTokens,
+		}
 	}
 	return result
+}
+
+func hasPromptCacheBreakdown(usage promptCacheUsage) bool {
+	return usage.BreakdownReported || usage.CacheCreation5mInputTokens > 0 || usage.CacheCreation1hInputTokens > 0
 }
 
 func canonicalizeCacheValue(value interface{}) string {
