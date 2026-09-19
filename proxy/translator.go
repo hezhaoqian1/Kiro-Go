@@ -376,6 +376,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	applyKiroAutomaticCachePoints(payload, modelID)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{
@@ -920,6 +921,83 @@ func validClaudeCacheControl(value interface{}) bool {
 	return strings.EqualFold(strings.TrimSpace(cacheType), "ephemeral")
 }
 
+const maxKiroCacheCheckpoints = 4
+
+func applyKiroAutomaticCachePoints(payload *KiroPayload, modelID string) {
+	if payload == nil || !modelSupportsKiroPromptCaching(modelID) {
+		return
+	}
+
+	checkpointCount := countKiroCachePoints(payload)
+	if checkpointCount >= maxKiroCacheCheckpoints {
+		return
+	}
+
+	markedHistoryUser := false
+	for index := range payload.ConversationState.History {
+		message := payload.ConversationState.History[index].UserInputMessage
+		if message == nil {
+			continue
+		}
+		markedHistoryUser = true
+		if message.CachePoint == nil {
+			message.CachePoint = newKiroCachePoint()
+			checkpointCount++
+		}
+		break
+	}
+
+	if !markedHistoryUser && checkpointCount < maxKiroCacheCheckpoints {
+		current := &payload.ConversationState.CurrentMessage.UserInputMessage
+		if current.CachePoint == nil {
+			current.CachePoint = newKiroCachePoint()
+			checkpointCount++
+		}
+	}
+
+	if checkpointCount >= maxKiroCacheCheckpoints {
+		return
+	}
+	for index := len(payload.ConversationState.History) - 1; index >= 0; index-- {
+		message := payload.ConversationState.History[index].AssistantResponseMessage
+		if message == nil {
+			continue
+		}
+		if message.CachePoint == nil {
+			message.CachePoint = newKiroCachePoint()
+		}
+		return
+	}
+}
+
+func countKiroCachePoints(payload *KiroPayload) int {
+	count := 0
+	if payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint != nil {
+		count++
+	}
+	if context := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext; context != nil {
+		for _, tool := range context.Tools {
+			if tool.CachePoint != nil {
+				count++
+			}
+		}
+	}
+	for _, entry := range payload.ConversationState.History {
+		if entry.UserInputMessage != nil && entry.UserInputMessage.CachePoint != nil {
+			count++
+		}
+		if entry.AssistantResponseMessage != nil && entry.AssistantResponseMessage.CachePoint != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func modelSupportsKiroPromptCaching(modelID string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(MapModel(modelID)))
+	return modelID == "auto" || strings.HasPrefix(modelID, "claude-") || strings.HasPrefix(modelID, "gpt-5.6-")
+}
+
 func hasNativeWebSearchInTools(tools []ClaudeTool) bool {
 	for _, t := range tools {
 		if isNativeWebSearchTool(t) {
@@ -1445,6 +1523,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if len(history) > 0 {
 		payload.ConversationState.History = history
 	}
+	applyKiroAutomaticCachePoints(payload, modelID)
 
 	if req.MaxTokens > 0 || req.Temperature > 0 || req.TopP > 0 {
 		payload.InferenceConfig = &InferenceConfig{

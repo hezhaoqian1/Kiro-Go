@@ -38,8 +38,8 @@ func TestClaudeCacheControlConvertsToKiroCachePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 3 {
-		t.Fatalf("expected system, history, and tool cache points, payload=%s", encoded)
+	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 4 {
+		t.Fatalf("expected explicit points plus the automatic assistant point, payload=%s", encoded)
 	}
 	if payload.ConversationState.History[0].UserInputMessage.CachePoint == nil {
 		t.Fatal("expected system cache point on the priming user message")
@@ -97,8 +97,9 @@ func TestClaudeHistoricalCacheControlUsesNestedMessageField(t *testing.T) {
 			if strings.Contains(string(encodedHistory), `},{"cachePoint"`) {
 				t.Fatalf("cache point must not be a standalone history entry: %s", encodedHistory)
 			}
-			if strings.Count(string(encodedHistory), `"cachePoint":{"type":"default"}`) != 1 {
-				t.Fatalf("expected one nested cache point: %s", encodedHistory)
+			checkpointCount := strings.Count(string(encodedHistory), `"cachePoint":{"type":"default"}`)
+			if checkpointCount < 1 || checkpointCount > maxKiroCacheCheckpoints {
+				t.Fatalf("unexpected nested cache point count %d: %s", checkpointCount, encodedHistory)
 			}
 			if !strings.Contains(string(encodedHistory), "Retain this reference text.") {
 				t.Fatal("cached message content was lost")
@@ -131,7 +132,7 @@ func TestClaudeCurrentMessageCacheControlUsesNestedField(t *testing.T) {
 }
 
 func TestClaudeIgnoresInvalidCacheControl(t *testing.T) {
-	request := &ClaudeRequest{Model: "claude-sonnet-5", Messages: []ClaudeMessage{{
+	request := &ClaudeRequest{Model: "deepseek-3.2", Messages: []ClaudeMessage{{
 		Role: "user",
 		Content: []interface{}{map[string]interface{}{
 			"type":          "text",
@@ -143,6 +144,74 @@ func TestClaudeIgnoresInvalidCacheControl(t *testing.T) {
 	payload := ClaudeToKiro(request, false)
 	if payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint != nil {
 		t.Fatal("unsupported cache_control type must not produce a Kiro cache point")
+	}
+}
+
+func TestKiroAutomaticallyAddsStableCachePoints(t *testing.T) {
+	request := &ClaudeRequest{
+		Model:  "claude-sonnet-5",
+		System: "Stable system instructions",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "First turn"},
+			{Role: "assistant", Content: "First answer"},
+			{Role: "user", Content: "Second turn"},
+		},
+	}
+
+	payload := ClaudeToKiro(request, false)
+	if countKiroCachePoints(payload) != 2 {
+		t.Fatalf("expected two automatic cache points, got %d", countKiroCachePoints(payload))
+	}
+	if payload.ConversationState.History[0].UserInputMessage.CachePoint == nil {
+		t.Fatal("first history user message must be a stable cache checkpoint")
+	}
+	last := payload.ConversationState.History[len(payload.ConversationState.History)-1]
+	if last.AssistantResponseMessage == nil || last.AssistantResponseMessage.CachePoint == nil {
+		t.Fatal("last history assistant message must be a cache checkpoint")
+	}
+}
+
+func TestKiroAutomaticCachePointsRespectRequestLimit(t *testing.T) {
+	tools := make([]ClaudeTool, 4)
+	for index := range tools {
+		tools[index] = ClaudeTool{
+			Name:         "tool_" + string(rune('a'+index)),
+			Description:  "test tool",
+			InputSchema:  map[string]interface{}{"type": "object"},
+			CacheControl: map[string]interface{}{"type": "ephemeral"},
+		}
+	}
+	request := &ClaudeRequest{
+		Model:  "claude-sonnet-4.6",
+		System: "Stable system instructions",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "First turn"},
+			{Role: "assistant", Content: "First answer"},
+			{Role: "user", Content: "Second turn"},
+		},
+		Tools: tools,
+	}
+
+	payload := ClaudeToKiro(request, false)
+	if countKiroCachePoints(payload) != maxKiroCacheCheckpoints {
+		t.Fatalf("cache checkpoint count exceeded limit: %d", countKiroCachePoints(payload))
+	}
+	if payload.ConversationState.History[0].UserInputMessage.CachePoint != nil {
+		t.Fatal("automatic cache point must not exceed a request already at the limit")
+	}
+}
+
+func TestOpenAIRequestsReceiveAutomaticKiroCachePoints(t *testing.T) {
+	request := &OpenAIRequest{Model: "claude-sonnet-5", Messages: []OpenAIMessage{
+		{Role: "system", Content: "Stable system instructions"},
+		{Role: "user", Content: "First turn"},
+		{Role: "assistant", Content: "First answer"},
+		{Role: "user", Content: "Second turn"},
+	}}
+
+	payload := OpenAIToKiro(request, false)
+	if countKiroCachePoints(payload) != 2 {
+		t.Fatalf("expected OpenAI conversion to add two cache points, got %d", countKiroCachePoints(payload))
 	}
 }
 
