@@ -203,6 +203,7 @@ type KiroUserInputMessage struct {
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
+	CachePoint              *KiroCachePoint          `json:"cachePoint,omitempty"`
 }
 
 type UserInputMessageContext struct {
@@ -257,7 +258,6 @@ type KiroImage struct {
 type KiroHistoryMessage struct {
 	UserInputMessage         *KiroUserInputMessage         `json:"userInputMessage,omitempty"`
 	AssistantResponseMessage *KiroAssistantResponseMessage `json:"assistantResponseMessage,omitempty"`
-	CachePoint               *KiroCachePoint               `json:"cachePoint,omitempty"`
 }
 
 type KiroCachePoint struct {
@@ -265,8 +265,9 @@ type KiroCachePoint struct {
 }
 
 type KiroAssistantResponseMessage struct {
-	Content  string        `json:"content"`
-	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+	Content    string          `json:"content"`
+	ToolUses   []KiroToolUse   `json:"toolUses,omitempty"`
+	CachePoint *KiroCachePoint `json:"cachePoint,omitempty"`
 }
 
 type KiroToolUse struct {

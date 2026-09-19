@@ -238,6 +238,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	var currentContent string
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
+	var currentCachePoint *KiroCachePoint
 
 	for i, msg := range req.Messages {
 		isLast := i == len(req.Messages)-1
@@ -250,11 +251,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				currentContent = content
 				currentImages = images
 				currentToolResults = toolResults
+				if claudeContentHasCacheControl(msg.Content) {
+					currentCachePoint = newKiroCachePoint()
+				}
 			} else {
 				userMsg := KiroUserInputMessage{
 					Content: content,
 					ModelID: modelID,
 					Origin:  origin,
+				}
+				if claudeContentHasCacheControl(msg.Content) {
+					userMsg.CachePoint = newKiroCachePoint()
 				}
 				if len(images) > 0 {
 					userMsg.Images = images
@@ -270,11 +277,15 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			}
 		} else if msg.Role == "assistant" {
 			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			assistantMsg := &KiroAssistantResponseMessage{
+				Content:  content,
+				ToolUses: toolUses,
+			}
+			if claudeContentHasCacheControl(msg.Content) {
+				assistantMsg.CachePoint = newKiroCachePoint()
+			}
 			history = append(history, KiroHistoryMessage{
-				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
-				},
+				AssistantResponseMessage: assistantMsg,
 			})
 		}
 	}
@@ -283,13 +294,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// Keep system instructions in history instead of user content.
 	if systemPrompt != "" {
+		systemMessage := &KiroUserInputMessage{
+			Content: systemPrompt,
+			ModelID: modelID,
+			Origin:  origin,
+		}
+		if claudeSystemHasCacheControl(req.System) {
+			systemMessage.CachePoint = newKiroCachePoint()
+		}
 		priming := []KiroHistoryMessage{
 			{
-				UserInputMessage: &KiroUserInputMessage{
-					Content: systemPrompt,
-					ModelID: modelID,
-					Origin:  origin,
-				},
+				UserInputMessage: systemMessage,
 			},
 			{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
@@ -338,10 +353,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: finalContent,
-		ModelID: modelID,
-		Origin:  origin,
-		Images:  currentImages,
+		Content:    finalContent,
+		ModelID:    modelID,
+		Origin:     origin,
+		Images:     currentImages,
+		CachePoint: currentCachePoint,
 	}
 
 	// Only attach structured tool results when they answer the last history
@@ -877,6 +893,31 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 
 func newKiroToolCachePoint() KiroToolWrapper {
 	return KiroToolWrapper{CachePoint: &KiroCachePoint{Type: "default"}}
+}
+
+func newKiroCachePoint() *KiroCachePoint {
+	return &KiroCachePoint{Type: "default"}
+}
+
+func claudeContentHasCacheControl(content interface{}) bool {
+	blocks := contentBlocksAsMaps(content)
+	if len(blocks) == 0 {
+		return false
+	}
+	return validClaudeCacheControl(blocks[len(blocks)-1]["cache_control"])
+}
+
+func claudeSystemHasCacheControl(system interface{}) bool {
+	return claudeContentHasCacheControl(system)
+}
+
+func validClaudeCacheControl(value interface{}) bool {
+	cacheControl, ok := value.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	cacheType, _ := cacheControl["type"].(string)
+	return strings.EqualFold(strings.TrimSpace(cacheType), "ephemeral")
 }
 
 func hasNativeWebSearchInTools(tools []ClaudeTool) bool {
@@ -1674,9 +1715,6 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 
 	for i := range history {
 		msg := &history[i]
-		if msg.CachePoint != nil {
-			continue
-		}
 
 		if msg.AssistantResponseMessage != nil {
 			// Scrub legacy tool-call narration that a polluted client may be
@@ -1733,10 +1771,6 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	cleaned := history[:0:0]
 	for i := range history {
 		msg := history[i]
-		if msg.CachePoint != nil {
-			cleaned = append(cleaned, msg)
-			continue
-		}
 		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
 			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
 			if c == "" || c == minimalFallbackUserContent {
@@ -1787,9 +1821,6 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	primingCount := 0
 	if hasPriming && len(history) >= 2 {
 		primingCount = 2
-		for primingCount < len(history) && history[primingCount].CachePoint != nil {
-			primingCount++
-		}
 	}
 
 	priming := history[:primingCount]
@@ -1861,19 +1892,17 @@ func historyEntryByteSize(entry KiroHistoryMessage) int {
 // dropLeadingAssistant removes a leading assistant message from a history tail so
 // it does not directly follow the placeholder user turn with a broken pairing.
 func dropLeadingAssistant(tail []KiroHistoryMessage) []KiroHistoryMessage {
-	for len(tail) > 0 && (tail[0].CachePoint != nil || tail[0].AssistantResponseMessage != nil) {
+	for len(tail) > 0 && tail[0].AssistantResponseMessage != nil {
 		tail = tail[1:]
 	}
 	return tail
 }
 
 func lastHistoryMessageIndex(history []KiroHistoryMessage) int {
-	for index := len(history) - 1; index >= 0; index-- {
-		if history[index].CachePoint == nil {
-			return index
-		}
+	if len(history) == 0 {
+		return -1
 	}
-	return -1
+	return len(history) - 1
 }
 
 // payloadByteSize returns the serialized size of the payload in bytes.

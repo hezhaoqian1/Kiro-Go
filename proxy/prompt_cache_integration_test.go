@@ -38,8 +38,14 @@ func TestClaudeCacheControlConvertsToKiroCachePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 1 {
-		t.Fatalf("expected only a tool cache point, payload=%s", encoded)
+	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 3 {
+		t.Fatalf("expected system, history, and tool cache points, payload=%s", encoded)
+	}
+	if payload.ConversationState.History[0].UserInputMessage.CachePoint == nil {
+		t.Fatal("expected system cache point on the priming user message")
+	}
+	if payload.ConversationState.History[2].UserInputMessage.CachePoint == nil {
+		t.Fatal("expected history cache point nested on the user message")
 	}
 	if len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools) != 2 {
 		t.Fatalf("expected tool plus cache point, got %#v", payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools)
@@ -70,7 +76,7 @@ func TestClaudeCacheControlConvertsToKiroCachePoints(t *testing.T) {
 	}
 }
 
-func TestClaudeHistoricalCacheControlPreservesHistoryWithoutUnsupportedEntries(t *testing.T) {
+func TestClaudeHistoricalCacheControlUsesNestedMessageField(t *testing.T) {
 	for _, role := range []string{"user", "assistant"} {
 		t.Run(role, func(t *testing.T) {
 			block := map[string]interface{}{
@@ -83,24 +89,60 @@ func TestClaudeHistoricalCacheControlPreservesHistoryWithoutUnsupportedEntries(t
 				{Role: role, Content: []interface{}{block}},
 				{Role: "user", Content: "Reply OK"},
 			}}
-			cached := ClaudeToKiro(request, false)
-			delete(block, "cache_control")
-			uncached := ClaudeToKiro(request, false)
-			cachedHistory, err := json.Marshal(cached.ConversationState.History)
+			payload := ClaudeToKiro(request, false)
+			encodedHistory, err := json.Marshal(payload.ConversationState.History)
 			if err != nil {
 				t.Fatal(err)
 			}
-			uncachedHistory, err := json.Marshal(uncached.ConversationState.History)
-			if err != nil {
-				t.Fatal(err)
+			if strings.Contains(string(encodedHistory), `},{"cachePoint"`) {
+				t.Fatalf("cache point must not be a standalone history entry: %s", encodedHistory)
 			}
-			if string(cachedHistory) != string(uncachedHistory) || strings.Contains(string(cachedHistory), "cachePoint") {
-				t.Fatalf("cache_control changed upstream history: %s", cachedHistory)
+			if strings.Count(string(encodedHistory), `"cachePoint":{"type":"default"}`) != 1 {
+				t.Fatalf("expected one nested cache point: %s", encodedHistory)
 			}
-			if !strings.Contains(string(cachedHistory), "Retain this reference text.") {
+			if !strings.Contains(string(encodedHistory), "Retain this reference text.") {
 				t.Fatal("cached message content was lost")
 			}
+			marked := payload.ConversationState.History[2]
+			if role == "user" && (marked.UserInputMessage == nil || marked.UserInputMessage.CachePoint == nil) {
+				t.Fatalf("user cache point not nested on message: %#v", marked)
+			}
+			if role == "assistant" && (marked.AssistantResponseMessage == nil || marked.AssistantResponseMessage.CachePoint == nil) {
+				t.Fatalf("assistant cache point not nested on message: %#v", marked)
+			}
 		})
+	}
+}
+
+func TestClaudeCurrentMessageCacheControlUsesNestedField(t *testing.T) {
+	request := &ClaudeRequest{Model: "claude-sonnet-5", Messages: []ClaudeMessage{{
+		Role: "user",
+		Content: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          "cache this current prefix",
+			"cache_control": map[string]interface{}{"type": "ephemeral"},
+		}},
+	}}}
+
+	payload := ClaudeToKiro(request, false)
+	if payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint == nil {
+		t.Fatal("expected cache point nested on current user message")
+	}
+}
+
+func TestClaudeIgnoresInvalidCacheControl(t *testing.T) {
+	request := &ClaudeRequest{Model: "claude-sonnet-5", Messages: []ClaudeMessage{{
+		Role: "user",
+		Content: []interface{}{map[string]interface{}{
+			"type":          "text",
+			"text":          "do not cache",
+			"cache_control": map[string]interface{}{"type": "permanent"},
+		}},
+	}}}
+
+	payload := ClaudeToKiro(request, false)
+	if payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint != nil {
+		t.Fatal("unsupported cache_control type must not produce a Kiro cache point")
 	}
 }
 
