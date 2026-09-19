@@ -284,6 +284,8 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
+	OnEvent        func(eventType string, event map[string]interface{})
+	OnAttempt      func(endpoint string, status int)
 	OnActivity     func()
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
@@ -486,6 +488,13 @@ endpointLoop:
 			guard := newStreamGuard(ctx, payload.ThinkingEnabled, getStreamOptions())
 			req = req.WithContext(guard.Context)
 			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+			if callback != nil && callback.OnAttempt != nil {
+				status := 0
+				if resp != nil {
+					status = resp.StatusCode
+				}
+				callback.OnAttempt(ep.Name, status)
+			}
 			if err != nil {
 				err = guard.Result(err)
 				guard.Close()
@@ -690,6 +699,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 			return emitted, fmt.Errorf("%w: %s", errKiroEventStreamUpstream, detail)
 		}
 
+		if callback.OnEvent != nil {
+			callback.OnEvent(headers[":event-type"], event)
+		}
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 		cacheUsage = mergePromptCacheUsage(cacheUsage, promptCacheUsageFromEvent(event))
 
