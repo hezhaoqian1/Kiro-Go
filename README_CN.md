@@ -121,9 +121,9 @@ Thinking 设置中的「触发后缀」可以留空。留空后，直接使用�
 
 ## Prompt Cache
 
-Claude 请求中的 `cache_control` 会尽可能转换为 Kiro 原生 `cachePoint`：工具定义后的缓存断点会插入 `userInputMessageContext.tools`，历史消息最后一个带缓存控制的内容块后会插入历史 `cachePoint`。系统提示目前只按原文发送，不伪造 Kiro 不支持的系统级缓存断点。
+Claude 工具定义中的 `cache_control` 会转换为 `userInputMessageContext.tools` 内的 `cachePoint`。这只是请求兼容映射，不代表上游已经缓存或给予缓存折扣。系统提示和消息上的 `cache_control` 接受但不转换为断点；保留正常内容。当前部署端点的对照实测中，历史数组插入独立 `cachePoint` 会导致 HTTP 400 `Improperly formed request`，移除该断点后同一请求成功，因此不再发送这种历史条目。
 
-代理不会根据本地 fingerprint、账号或 TTL 猜测缓存命中。只有 Kiro 上游实际返回缓存 usage 时，Claude 响应才会带 `cache_read_input_tokens`、`cache_creation_input_tokens` 和对应的 5 分钟/1 小时明细；没有上游 usage 就不会报告缓存命中。Kiro 账号、区域或接口不返回这些字段时，说明当前请求无法确认发生了真实缓存命中。
+代理不会根据本地 fingerprint、账号或 TTL 猜测缓存命中。只有 Kiro 上游实际返回缓存 usage 时，Claude 响应才会带缓存统计；5 分钟/1 小时明细仅有上游报告才有意义，TTL 选择不保证支持。当前部署的工具前缀重复请求（流式与非流式）均未观察到缓存统计，因此不能宣称已实现 Anthropic 官方 Prompt Caching 或缓存折扣。`stream=true` 与缓存是否生效独立，关闭流式不会开启缓存。BirdSub2Api 账单金额是网关定价结果，不是 Kiro 实际 credits 的缓存证明。
 
 ## 共享流式链路与完整性
 

@@ -254,7 +254,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				history = append(history, KiroHistoryMessage{
 					UserInputMessage: &userMsg,
 				})
-				appendClaudeHistoryCachePoint(&history, msg.Content)
 			}
 		} else if msg.Role == "assistant" {
 			content, toolUses := extractClaudeAssistantContent(msg.Content)
@@ -264,7 +263,6 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 					ToolUses: toolUses,
 				},
 			})
-			appendClaudeHistoryCachePoint(&history, msg.Content)
 		}
 	}
 
@@ -864,32 +862,8 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	return result, nameMap
 }
 
-func newKiroCachePoint() KiroHistoryMessage {
-	return KiroHistoryMessage{CachePoint: &KiroCachePoint{Type: "default"}}
-}
-
 func newKiroToolCachePoint() KiroToolWrapper {
 	return KiroToolWrapper{CachePoint: &KiroCachePoint{Type: "default"}}
-}
-
-func appendClaudeHistoryCachePoint(history *[]KiroHistoryMessage, content interface{}) {
-	if claudeContentHasCacheControl(content) {
-		*history = append(*history, newKiroCachePoint())
-	}
-}
-
-func claudeContentHasCacheControl(content interface{}) bool {
-	blocks := contentBlocksAsMaps(content)
-	if len(blocks) == 0 {
-		return false
-	}
-	_, ok := cacheControlMap(blocks[len(blocks)-1]["cache_control"])
-	return ok
-}
-
-func cacheControlMap(value interface{}) (map[string]interface{}, bool) {
-	control, ok := value.(map[string]interface{})
-	return control, ok && len(control) > 0
 }
 
 func hasNativeWebSearchInTools(tools []ClaudeTool) bool {

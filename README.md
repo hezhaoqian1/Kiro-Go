@@ -121,9 +121,9 @@ Explicit `thinking.type=disabled` overrides the suffix. Enabled mode honors an e
 
 ## Prompt Cache
 
-Claude `cache_control` directives are converted to Kiro-native `cachePoint` entries where the upstream shape supports them: after cached tool definitions in `userInputMessageContext.tools`, and after the last cached content block in historical messages. System prompts are sent as text; the proxy does not fabricate a Kiro system-level cache point that Kiro does not expose.
+Claude tool `cache_control` directives map to `cachePoint` entries in `userInputMessageContext.tools`. This request mapping does not prove cache creation, hits, or discounts. System and message cache directives are accepted without generating breakpoints; their normal content is retained. Controlled tests on the deployed endpoint returned HTTP 400 `Improperly formed request` with standalone history cachePoint entries, while the same request succeeded without them, so those history entries are no longer emitted.
 
-The proxy does not infer cache hits from local fingerprints, account IDs, or TTLs. Claude cache usage fields (`cache_read_input_tokens`, `cache_creation_input_tokens`, and the 5-minute/1-hour breakdown) are returned only when Kiro actually sends corresponding upstream usage. If the Kiro account, region, or endpoint does not return those fields, the request cannot be reported as a confirmed cache hit.
+The proxy does not infer cache hits from local fingerprints, account IDs, or TTLs. Cache statistics rely on upstream usage; the 5-minute/1-hour breakdown requires upstream evidence and TTL selection is not guaranteed. Repeated tool-prefix requests on the deployed endpoint, both streamed and buffered, exposed no cache statistics. Anthropic Prompt Caching and its discounts therefore remain unverified. Streaming is independent of caching: setting `stream=false` does not enable caching. BirdSub2Api charges reflect gateway pricing, not proof of cache savings in Kiro credits.
 
 ## Shared Streaming and Completion Policy
 

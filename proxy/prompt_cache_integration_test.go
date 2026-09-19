@@ -38,8 +38,8 @@ func TestClaudeCacheControlConvertsToKiroCachePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 2 {
-		t.Fatalf("expected message and tool cache points, payload=%s", encoded)
+	if strings.Count(string(encoded), `"cachePoint":{"type":"default"}`) != 1 {
+		t.Fatalf("expected only a tool cache point, payload=%s", encoded)
 	}
 	if len(payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools) != 2 {
 		t.Fatalf("expected tool plus cache point, got %#v", payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext.Tools)
@@ -67,6 +67,40 @@ func TestClaudeCacheControlConvertsToKiroCachePoints(t *testing.T) {
 	}
 	if string(tools[1]["cachePoint"]) != `{"type":"default"}` {
 		t.Fatalf("unexpected serialized cache point: %s", tools[1]["cachePoint"])
+	}
+}
+
+func TestClaudeHistoricalCacheControlPreservesHistoryWithoutUnsupportedEntries(t *testing.T) {
+	for _, role := range []string{"user", "assistant"} {
+		t.Run(role, func(t *testing.T) {
+			block := map[string]interface{}{
+				"type": "text", "text": "Retain this reference text.",
+				"cache_control": map[string]interface{}{"type": "ephemeral"},
+			}
+			request := &ClaudeRequest{Model: "claude-sonnet-5", Messages: []ClaudeMessage{
+				{Role: "user", Content: "First question"},
+				{Role: "assistant", Content: "First answer"},
+				{Role: role, Content: []interface{}{block}},
+				{Role: "user", Content: "Reply OK"},
+			}}
+			cached := ClaudeToKiro(request, false)
+			delete(block, "cache_control")
+			uncached := ClaudeToKiro(request, false)
+			cachedHistory, err := json.Marshal(cached.ConversationState.History)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uncachedHistory, err := json.Marshal(uncached.ConversationState.History)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(cachedHistory) != string(uncachedHistory) || strings.Contains(string(cachedHistory), "cachePoint") {
+				t.Fatalf("cache_control changed upstream history: %s", cachedHistory)
+			}
+			if !strings.Contains(string(cachedHistory), "Retain this reference text.") {
+				t.Fatal("cached message content was lost")
+			}
+		})
 	}
 }
 
